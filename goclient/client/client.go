@@ -24,6 +24,10 @@ func (req *Req) Request() *graph.Request {
 	return &req.gr
 }
 
+func (req *Req) Mutation() graph.Mutation {
+	return *req.gr.Mutation
+}
+
 func checkNQuad(sub, pred, objId string, objVal Value) error {
 	if len(sub) == 0 {
 		return fmt.Errorf("Subject can't be empty")
@@ -31,7 +35,8 @@ func checkNQuad(sub, pred, objId string, objVal Value) error {
 	if len(pred) == 0 {
 		return fmt.Errorf("Predicate can't be empty")
 	}
-	hasVal := objVal != nil && objVal.Val != nil
+
+	hasVal := objVal != nil && objVal.Val.(*graph.Value_StrVal).StrVal != ""
 	if len(objId) == 0 && !hasVal {
 		return fmt.Errorf("Both objectId and objectValue can't be nil")
 	}
@@ -84,4 +89,8 @@ func (req *Req) DelMutation(sub, pred, objId string, value Value, label string) 
 		Label: label,
 	})
 	return nil
+}
+
+func (req *Req) IsEmpty() bool {
+	return len(req.gr.Mutation.Set) == 0 && len(req.gr.Mutation.Del) == 0
 }

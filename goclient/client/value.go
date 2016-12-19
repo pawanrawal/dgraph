@@ -16,9 +16,7 @@
 
 package client
 
-import (
-	"github.com/dgraph-io/dgraph/query/graph"
-)
+import "github.com/dgraph-io/dgraph/query/graph"
 
 // Value represents a value sent in a mutation.
 type Value *graph.Value

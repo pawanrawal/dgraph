@@ -9,25 +9,28 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/grpc"
+
+	"github.com/dgraph-io/dgraph/goclient/client"
+	"github.com/dgraph-io/dgraph/query/graph"
+	"github.com/dgraph-io/dgraph/rdf"
 	"github.com/dgraph-io/dgraph/x"
 )
 
 var (
 	files      = flag.String("r", "", "Location of rdf files to load")
-	dgraph     = flag.String("d", "http://127.0.0.1:8080/query", "Dgraph server address")
+	dgraph     = flag.String("d", "127.0.0.1:8080", "Dgraph server address")
 	concurrent = flag.Int("c", 100, "Number of concurrent requests to make to Dgraph")
 	numRdf     = flag.Int("m", 1000, "Number of RDF N-Quads to send as part of a mutation.")
 )
@@ -47,12 +50,12 @@ type status struct {
 	start     time.Time
 }
 
-var hc http.Client
+var dc graph.DgraphClient
 var r response
 var s *status
 
-func makeRequests(mutation chan string, wg *sync.WaitGroup) {
-	for m := range mutation {
+func makeRequests(requests chan *graph.Request, wg *sync.WaitGroup) {
+	for req := range requests {
 		counter := atomic.AddUint64(&s.mutations, 1)
 		if counter%100 == 0 {
 			num := atomic.LoadUint64(&s.rdfs)
@@ -61,26 +64,13 @@ func makeRequests(mutation chan string, wg *sync.WaitGroup) {
 			fmt.Printf("[Request: %6d] Total RDFs done: %8d RDFs per second: %7.0f\r", counter, num, rate)
 		}
 	RETRY:
-		req, err := http.NewRequest("POST", *dgraph, strings.NewReader(body(m)))
-		x.Check(err)
-		res, err := hc.Do(req)
+		ctx, _ := context.WithTimeout(context.Background(), time.Minute)
+		_, err := dc.Query(ctx, req)
 		if err != nil {
+			// log.Fatalf("Mutation: %+v, error: %+v\n", req.Mutation, err)
 			fmt.Printf("Retrying req: %d. Error: %v\n", counter, err)
 			time.Sleep(5 * time.Millisecond)
 			goto RETRY
-		}
-
-		body, err := ioutil.ReadAll(res.Body)
-		x.Check(err)
-		if err = json.Unmarshal(body, &r); err != nil {
-			// Not doing x.Checkf(json.Unmarshal..., "Response..", string(body))
-			// to ensure that we don't try to convert body from []byte to string
-			// when there's no errors.
-			x.Checkf(err, "HTTP Status: %s Response body: %s.",
-				http.StatusText(res.StatusCode), string(body))
-		}
-		if r.Code != "ErrorOk" {
-			log.Fatalf("Error while performing mutation: %v, err: %v", m, r.Message)
 		}
 	}
 	wg.Done()
@@ -115,16 +105,23 @@ func processFile(file string) {
 	gr, err := gzip.NewReader(f)
 	x.Check(err)
 
-	hc = http.Client{Timeout: time.Minute}
-	mutation := make(chan string, 3*(*concurrent))
+	conn, err := grpc.Dial(*dgraph, grpc.WithInsecure())
+	if err != nil {
+		log.Fatal("DialTCPConnection")
+	}
+	defer conn.Close()
+
+	dc = graph.NewDgraphClient(conn)
+	requests := make(chan *graph.Request, 3*(*concurrent))
 
 	var wg sync.WaitGroup
 	for i := 0; i < *concurrent; i++ {
 		wg.Add(1)
-		go makeRequests(mutation, &wg)
+		go makeRequests(requests, &wg)
 	}
 
 	var buf bytes.Buffer
+	req := client.NewRequest()
 	bufReader := bufio.NewReader(gr)
 	num := 0
 	for {
@@ -132,23 +129,32 @@ func processFile(file string) {
 		if err != nil {
 			break
 		}
-		buf.WriteRune('\n')
+		nq, err := rdf.Parse(buf.String())
+		x.Check(err)
+		buf.Reset()
+		if err := req.SetMutation(nq.Subject, nq.Predicate, nq.ObjectId,
+			client.Str(string(nq.ObjectValue)), nq.Label); err != nil {
+			log.Fatal("While setting mutation: ", err)
+		}
+
 		atomic.AddUint64(&s.rdfs, 1)
 		num++
 
 		if num >= *numRdf {
-			mutation <- buf.String()
-			buf.Reset()
+			m := req.Mutation()
+			requests <- &graph.Request{Mutation: &m}
+			req = client.NewRequest()
 			num = 0
 		}
 	}
 	if err != io.EOF {
 		x.Checkf(err, "Error while reading file")
 	}
-	if buf.Len() > 0 {
-		mutation <- buf.String()
+	if !req.IsEmpty() {
+		m := req.Mutation()
+		requests <- &graph.Request{Mutation: &m}
 	}
-	close(mutation)
+	close(requests)
 
 	wg.Wait()
 }
