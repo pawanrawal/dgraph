@@ -68,6 +68,7 @@ get_version() {
 
 TRAVIS_EVENT_TYPE=${TRAVIS_EVENT_TYPE:-cron}
 if ! run_upload_script; then
+	echo "Skipping running the build script"
 	exit 1
 fi
 
@@ -111,21 +112,6 @@ update_or_create_asset() {
 		> /dev/null
 }
 
-delete_old_nightly() {
-	local release_id
-	read release_id < <( \
-		send_gh_api_request repos/${DGRAPH_REPO}/releases \
-		| jq -r -c "(.[] | select(.tag_name == \"${BUILD_TAG}\").id), \"\"") \
-		|| exit
-
-	if [[ ! -z "${release_id}" ]]; then
-		echo "Deleting old nightly release"
-		send_gh_api_request repos/${DGRAPH_REPO}/releases/${release_id} \
-			DELETE \
-			> /dev/null
-	fi
-}
-
 get_release_body() {
 	echo '
 	Dgraph development (pre-release) build which is updated every night.
@@ -144,6 +130,7 @@ upload_nightly() {
 
 	if [[ -z "${release_id}" ]]; then
 		echo "Creating release for tag ${BUILD_TAG}."
+		# TODO - For actual releases add draft true and prerelease false.
 		read release_id < <( \
 			send_gh_api_data_request repos/${DGRAPH_REPO}/releases POST \
 			"{ \"name\": \"Dgraph ${DGRAPH_VERSION}${ASSET_SUFFIX}\", \"tag_name\": \"${BUILD_TAG}\", \
@@ -166,7 +153,7 @@ upload_nightly() {
 
 		# We dont want to update description programatically for version releases apart from
 		# nightly.
-		if [[ $BUILD_TAG == "nightly" ]]; then;
+		if [[ $BUILD_TAG == "nightly" ]]; then
 			echo 'Updating release description.'
 			send_gh_api_data_request repos/${DGRAPH_REPO}/releases/${release_id} PATCH \
 				"{ \"body\": $(get_release_body | jq -s -c -R '.') }" \
@@ -227,16 +214,19 @@ upload_docker_image() {
 
 pushd $DGRAPH > /dev/null
 echo "Building embedded binaries"
-contrib/releases/build.sh $ASSET_SUFFIX
+# contrib/releases/build.sh $ASSET_SUFFIX
 build_docker_image
 
-if [ "$TRAVIS" = true ]; then
-	upload_nightly
-	upload_docker_image
-fi
+# if [ "$TRAVIS" = true ]; then
+#	upload_nightly
+#	upload_docker_image
+# fi
 
-if [ "$DGRAPH" != "$CURRENT_DIR" ]; then
-	mv $ASSETS_FILE $NIGHTLY_FILE $SHA_FILE $CURRENT_DIR
-fi
+# if [ "$DGRAPH" != "$CURRENT_DIR" ]; then
+# 	mv $ASSETS_FILE $NIGHTLY_FILE $SHA_FILE $CURRENT_DIR
+# fi
 
+printenv
+ls $CURRENT_DIR
+docker images
 popd > /dev/null
