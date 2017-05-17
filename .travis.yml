@@ -47,8 +47,8 @@ cache:
   - $HOME/Library/Caches/Homebrew
 
 install:
-- bash contrib/build-rocksdb.sh $HOME/build
+  # - bash contrib/build-rocksdb.sh $HOME/build
 before_script:
-- go get github.com/mattn/goveralls
+  # - go get github.com/mattn/goveralls
 script:
 - contrib/nightly/build.sh
