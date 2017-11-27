@@ -1,7 +1,0 @@
-type  Person {
-}
-
-type Film {
-  name: string
-  budget: int
-}

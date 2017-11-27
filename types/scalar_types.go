@@ -1,11 +1,11 @@
 /*
- * Copyright 2016 DGraph Labs, Inc.
+ * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * 		http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,7 @@ package types
 import (
 	"time"
 
+	"github.com/dgraph-io/dgraph/protos/intern"
 	geom "github.com/twpayne/go-geom"
 )
 
@@ -31,32 +32,39 @@ const (
 // data. When adding a new type *always* add to the end of this list.
 // Never delete anything from this list even if it becomes unused.
 const (
-	BinaryID   = TypeID(Posting_BINARY)
-	Int32ID    = TypeID(Posting_INT32)
-	FloatID    = TypeID(Posting_FLOAT)
-	BoolID     = TypeID(Posting_BOOL)
-	DateTimeID = TypeID(Posting_DATETIME)
-	StringID   = TypeID(Posting_STRING)
-	DateID     = TypeID(Posting_DATE)
-	GeoID      = TypeID(Posting_GEO)
+	BinaryID   = TypeID(intern.Posting_BINARY)
+	IntID      = TypeID(intern.Posting_INT)
+	FloatID    = TypeID(intern.Posting_FLOAT)
+	BoolID     = TypeID(intern.Posting_BOOL)
+	DateTimeID = TypeID(intern.Posting_DATETIME)
+	StringID   = TypeID(intern.Posting_STRING)
+	GeoID      = TypeID(intern.Posting_GEO)
+	UidID      = TypeID(intern.Posting_UID)
+	PasswordID = TypeID(intern.Posting_PASSWORD)
+	DefaultID  = TypeID(intern.Posting_DEFAULT)
 )
 
 var typeNameMap = map[string]TypeID{
-	"int":      Int32ID,
+	"int":      IntID,
 	"float":    FloatID,
 	"string":   StringID,
 	"bool":     BoolID,
-	"id":       StringID,
 	"datetime": DateTimeID,
-	"date":     DateID,
 	"geo":      GeoID,
+	"uid":      UidID,
+	"password": PasswordID,
+	"default":  DefaultID,
 }
 
-type TypeID Posting_ValType
+type TypeID intern.Posting_ValType
+
+func (t TypeID) Enum() intern.Posting_ValType {
+	return intern.Posting_ValType(t)
+}
 
 func (t TypeID) Name() string {
 	switch t {
-	case Int32ID:
+	case IntID:
 		return "int"
 	case FloatID:
 		return "float"
@@ -64,16 +72,23 @@ func (t TypeID) Name() string {
 		return "bool"
 	case StringID:
 		return "string"
-	case DateID:
-		return "date"
 	case DateTimeID:
-		return "dateTime"
+		return "datetime"
 	case GeoID:
 		return "geo"
+	case UidID:
+		return "uid"
+	case PasswordID:
+		return "password"
+	case DefaultID:
+		return "default"
+	case BinaryID:
+		return "binary"
 	}
 	return ""
 }
 
+// Val is a value with type information.
 type Val struct {
 	Tid   TypeID
 	Value interface{}
@@ -86,6 +101,10 @@ func TypeForName(name string) (TypeID, bool) {
 	return t, ok
 }
 
+func (t TypeID) IsScalar() bool {
+	return t != UidID
+}
+
 // ValueForType returns the zero value for a type id
 func ValueForType(id TypeID) Val {
 	switch id {
@@ -93,9 +112,9 @@ func ValueForType(id TypeID) Val {
 		var b []byte
 		return Val{BinaryID, &b}
 
-	case Int32ID:
-		var i int32
-		return Val{Int32ID, &i}
+	case IntID:
+		var i int64
+		return Val{IntID, &i}
 
 	case FloatID:
 		var f float64
@@ -111,15 +130,23 @@ func ValueForType(id TypeID) Val {
 
 	case StringID:
 		var s string
-		return Val{StringID, &s}
+		return Val{StringID, s}
 
-	case DateID:
-		var d time.Time
-		return Val{DateID, &d}
+	case DefaultID:
+		var s string
+		return Val{DefaultID, s}
 
 	case GeoID:
 		var g geom.T
 		return Val{GeoID, &g}
+
+	case UidID:
+		var i uint64
+		return Val{UidID, &i}
+
+	case PasswordID:
+		var p string
+		return Val{PasswordID, p}
 
 	default:
 		return Val{}
@@ -132,6 +159,25 @@ func createDate(y int, m time.Month, d int) time.Time {
 	return dt
 }
 
+func ParseTime(val string) (time.Time, error) {
+	var t time.Time
+	if err := t.UnmarshalText([]byte(val)); err == nil {
+		return t, err
+	}
+	// try without timezone
+	if t, err := time.Parse(dateTimeFormat, val); err == nil {
+		return t, err
+	}
+	if t, err := time.Parse(dateFormatYMD, val); err == nil {
+		return t, err
+	}
+	if t, err := time.Parse(dateFormatYM, val); err == nil {
+		return t, err
+	}
+	return time.Parse(dateFormatY, val)
+}
+
 const dateFormatYMD = "2006-01-02"
 const dateFormatYM = "2006-01"
 const dateFormatY = "2006"
+const dateTimeFormat = "2006-01-02T15:04:05"

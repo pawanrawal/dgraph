@@ -1,53 +1,43 @@
 /*
- * Copyright 2016 DGraph Labs, Inc.
+ * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package schema
 
-import "github.com/dgraph-io/dgraph/lex"
-
-const (
-	leftCurl   = '{'
-	rightCurl  = '}'
-	leftRound  = '('
-	rightRound = ')'
-	collon     = ':'
+import (
+	"github.com/dgraph-io/dgraph/lex"
 )
 
 // Constants representing type of different graphql lexed items.
 const (
 	itemText       lex.ItemType = 5 + iota // plain text
-	itemScalar                             // scalar
-	itemType                               // type
 	itemLeftCurl                           // left curly bracket
 	itemRightCurl                          // right curly bracket
-	itemComment                            // comment
+	itemColon                              // colon
 	itemLeftRound                          // left round bracket
 	itemRightRound                         // right round bracket
-	itemScalarName
-	itemScalarType
-	itemObject
-	itemObjectName
-	itemObjectType
-	itemCollon
 	itemAt
-	itemIndex
-	itemDummy // Used if index specification is missing
+	itemComma
+	itemNewLine
+	itemDot
+	itemUnderscore
+	itemLeftSquare
+	itemRightSquare
 )
 
-// lexText lexes the input string and calls other lex functions.
 func lexText(l *lex.Lexer) lex.StateFn {
 Loop:
 	for {
@@ -56,9 +46,38 @@ Loop:
 			break Loop
 		case isNameBegin(r):
 			l.Backup()
-			return lexStart
-		case isSpace(r) || isEndOfLine(r):
+			return lexWord
+		case isSpace(r):
 			l.Ignore()
+		case isEndOfLine(r):
+			l.Emit(itemNewLine)
+		case r == '.':
+			l.Emit(itemDot)
+		case r == ',':
+			l.Emit(itemComma)
+		case r == '<':
+			if err := lex.LexIRIRef(l, itemText); err != nil {
+				return l.Errorf("Invalid schema: %v", err)
+			}
+		case r == '{':
+			l.Emit(itemLeftCurl)
+		case r == '}':
+			l.Emit(itemRightCurl)
+		case r == '(':
+			l.Emit(itemLeftRound)
+		case r == ')':
+			l.Emit(itemRightRound)
+		case r == ':':
+			l.Emit(itemColon)
+		case r == '@':
+			l.Emit(itemAt)
+		case r == '[':
+			l.Emit(itemLeftSquare)
+		case r == ']':
+			l.Emit(itemRightSquare)
+		case r == '_':
+			// Predicates can start with _.
+			return lexWord
 		default:
 			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
 		}
@@ -70,298 +89,18 @@ Loop:
 	return nil
 }
 
-func lexStart(l *lex.Lexer) lex.StateFn {
+func lexWord(l *lex.Lexer) lex.StateFn {
 	for {
+		// The caller already checked isNameBegin, and absorbed one rune.
 		r := l.Next()
 		if isNameSuffix(r) {
-			continue // absorb
+			continue
 		}
 		l.Backup()
-		// l.Pos would be index of the end of operation type + 1.
-		word := l.Input[l.Start:l.Pos]
-		if word == "scalar" {
-			l.Emit(itemScalar)
-			return lexScalar
-		} else if word == "type" {
-			l.Emit(itemType)
-			return lexObject
-		} else {
-			return l.Errorf("Invalid schema")
-		}
-	}
-
-}
-
-func lexScalar(l *lex.Lexer) lex.StateFn {
-	for {
-		switch r := l.Next(); {
-		case isNameBegin(r):
-			l.Backup()
-			return lexScalarPair
-		case r == leftRound:
-			l.Emit(itemLeftRound)
-			l.Next()
-			return lexScalarBlock
-		case isSpace(r) || isEndOfLine(r):
-			l.Ignore()
-		default:
-			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
-		}
-	}
-}
-
-func lexScalarBlock(l *lex.Lexer) lex.StateFn {
-	for {
-		switch r := l.Next(); {
-		case r == ')':
-			l.Emit(itemRightRound)
-			return lexText
-		case isNameBegin(r):
-			l.Backup()
-			return lexScalarPair1
-		case isSpace(r) || isEndOfLine(r):
-			l.Ignore()
-		default:
-			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
-		}
-	}
-}
-
-func lexObject(l *lex.Lexer) lex.StateFn {
-	for {
-		switch r := l.Next(); {
-		case r == rightCurl:
-			return lexText
-		case isSpace(r) || isEndOfLine(r):
-			l.Ignore()
-		case isNameBegin(r):
-			{
-				for {
-					r := l.Next()
-					if isNameSuffix(r) {
-						continue // absorb
-					}
-					l.Backup()
-					l.Emit(itemObject)
-					break
-				}
-				return lexObjectBlock
-			}
-		default:
-			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
-		}
-	}
-}
-
-func lexObjectBlock(l *lex.Lexer) lex.StateFn {
-	for {
-		switch r := l.Next(); {
-		case r == leftCurl:
-			l.Emit(itemLeftCurl)
-		case isSpace(r) || isEndOfLine(r):
-			l.Ignore()
-		case r == rightCurl:
-			l.Emit(itemRightCurl)
-			return lexText
-		case isNameBegin(r):
-			return lexObjectPair
-		default:
-			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
-		}
-	}
-}
-
-func lexScalarPair(l *lex.Lexer) lex.StateFn {
-	for {
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue // absorb
-		}
-		l.Backup()
-		// l.Pos would be index of the end of operation type + 1.
-		l.Emit(itemScalarName)
+		l.Emit(itemText)
 		break
-	}
-
-L:
-	for {
-		switch r := l.Next(); {
-		case isSpace(r) || isEndOfLine(r):
-			l.Ignore()
-		case r == ':':
-			l.Emit(itemCollon)
-			break
-		case isNameBegin(r):
-			l.Backup()
-			break L
-		default:
-			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
-		}
-	}
-
-	for {
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue // absorb
-		}
-		l.Backup()
-		l.Emit(itemScalarType)
-		break
-	}
-
-	// Check for the mention of @index.
-	var isIndexed bool
-L1:
-	for {
-		switch r := l.Next(); {
-		case isSpace(r):
-			l.Ignore()
-		case isEndOfLine(r):
-			break L1
-		case r == '@':
-			l.Emit(itemAt)
-			isIndexed = true
-			for {
-				r := l.Next()
-				if isNameSuffix(r) {
-					continue // absorb
-				}
-				l.Backup()
-				// l.Pos would be index of the end of operation type + 1.
-				word := l.Input[l.Start:l.Pos]
-				if word == "index" {
-					l.Emit(itemIndex)
-					break L1
-				} else {
-					return l.Errorf("Invalid mention of index")
-				}
-			}
-			break L1
-		default:
-			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
-		}
-	}
-	if !isIndexed {
-		l.Emit(itemDummy)
 	}
 	return lexText
-}
-
-func lexScalarPair1(l *lex.Lexer) lex.StateFn {
-	for {
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue // absorb
-		}
-		l.Backup()
-		// l.Pos would be index of the end of operation type + 1.
-		l.Emit(itemScalarName)
-		break
-	}
-
-L:
-	for {
-		switch r := l.Next(); {
-		case isSpace(r) || isEndOfLine(r):
-			l.Ignore()
-		case r == ':':
-			l.Emit(itemCollon)
-			break
-		case isNameBegin(r):
-			l.Backup()
-			break L
-		default:
-			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
-		}
-	}
-
-	for {
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue // absorb
-		}
-		l.Backup()
-		l.Emit(itemScalarType)
-		break
-	}
-
-	// Check for the mention of @index.
-	var isIndexed bool
-L1:
-	for {
-		switch r := l.Next(); {
-		case isSpace(r):
-			l.Ignore()
-		case isEndOfLine(r):
-			break L1
-		case r == '@':
-			l.Emit(itemAt)
-			isIndexed = true
-			for {
-				r := l.Next()
-				if isNameSuffix(r) {
-					continue // absorb
-				}
-				l.Backup()
-				// l.Pos would be index of the end of operation type + 1.
-				word := l.Input[l.Start:l.Pos]
-				if word == "index" {
-					l.Emit(itemIndex)
-					break L1
-				} else {
-					return l.Errorf("Invalid mention of index")
-				}
-			}
-			break L1
-		default:
-			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
-		}
-	}
-	if !isIndexed {
-		l.Emit(itemDummy)
-	}
-	return lexScalarBlock
-}
-
-func lexObjectPair(l *lex.Lexer) lex.StateFn {
-	for {
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue // absorb
-		}
-		l.Backup()
-		l.Emit(itemObjectName)
-		break
-	}
-
-L:
-	for {
-		switch r := l.Next(); {
-		case isSpace(r) || isEndOfLine(r):
-			l.Ignore()
-		case r == ':':
-			l.Emit(itemCollon)
-			break
-		case isNameBegin(r):
-			l.Backup()
-			break L
-		default:
-			return l.Errorf("Invalid schema. Unexpected %s", l.Input[l.Start:l.Pos])
-		}
-	}
-
-	for {
-		r := l.Next()
-		if isNameSuffix(r) {
-			continue // absorb
-		}
-		l.Backup()
-		l.Emit(itemObjectType)
-		break
-	}
-
-	return lexObjectBlock
-
 }
 
 // isNameBegin returns true if the rune is an alphabet.
@@ -396,5 +135,5 @@ func isSpace(r rune) bool {
 
 // isEndOfLine returns true if the rune is a Linefeed or a Carriage return.
 func isEndOfLine(r rune) bool {
-	return r == '\u000A' || r == '\u000D'
+	return r == '\n' || r == '\u000D'
 }
