@@ -1,53 +1,51 @@
 /*
- * Copyright 2015 DGraph Labs, Inc.
+ * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * 		http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package posting
 
 import (
-	"context"
-	"flag"
+	"crypto/md5"
 	"fmt"
 	"io/ioutil"
-	"log"
+	"math"
 	"os"
 	"os/exec"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/dgryski/go-farm"
+	"golang.org/x/net/trace"
 
-	"github.com/dgraph-io/dgraph/store"
+	"github.com/dgraph-io/badger"
+
+	"github.com/dgraph-io/dgraph/protos/intern"
 	"github.com/dgraph-io/dgraph/x"
 )
 
 var (
-	maxmemory = flag.Int("stw_ram_mb", 4096,
-		"If RAM usage exceeds this, we stop the world, and flush our buffers.")
+	dummyPostingList []byte // Used for indexing.
+	elog             trace.EventLog
+)
 
-	commitFraction = flag.Float64("gentlecommit", 0.10, "Fraction of dirty posting lists to commit every few seconds.")
-	lhmapNumShards = flag.Int("lhmap", 32, "Number of shards for lhmap.")
-
-	dirtyChan       chan uint64 // All dirty posting list keys are pushed here.
-	startCommitOnce sync.Once
-	marks           syncMarks
+const (
+	MB = 1 << 20
 )
 
 // syncMarks stores the watermark for synced RAFT proposals. Each RAFT proposal consists
@@ -62,196 +60,20 @@ var (
 // This watermark would be used for taking snapshots, to ensure that all the data and
 // index mutations have been syned to RocksDB, before a snapshot is taken, and previous
 // RAFT entries discarded.
-type syncMarks struct {
-	sync.RWMutex
-	m map[uint32]*x.WaterMark
-}
-
-func (g *syncMarks) create(group uint32) *x.WaterMark {
-	g.Lock()
-	defer g.Unlock()
-
-	if prev, present := g.m[group]; present {
-		return prev
-	}
-	w := &x.WaterMark{Name: fmt.Sprintf("group: %d", group)}
-	w.Init()
-	if g.m == nil {
-		g.m = make(map[uint32]*x.WaterMark)
-	}
-	g.m[group] = w
-	return w
-}
-
-func (g *syncMarks) Get(group uint32) *x.WaterMark {
-	g.RLock()
-	if w, present := g.m[group]; present {
-		g.RUnlock()
-		return w
-	}
-	g.RUnlock()
-	return g.create(group)
-}
-
-type counters struct {
-	ticker  *time.Ticker
-	done    uint64
-	noop    uint64
-	lastVal uint64
-}
-
-func (c *counters) periodicLog() {
-	for _ = range c.ticker.C {
-		c.log()
-	}
-}
-
-func (c *counters) log() {
-	done := atomic.LoadUint64(&c.done)
-	noop := atomic.LoadUint64(&c.noop)
-	lastVal := atomic.LoadUint64(&c.lastVal)
-	if done == lastVal {
-		// Ignore.
-		return
-	}
-	atomic.StoreUint64(&c.lastVal, done)
-
-	log.Printf("Commit counters. done: %5d noop: %5d\n", done, noop)
-}
-
-func newCounters() *counters {
-	c := new(counters)
-	c.ticker = time.NewTicker(time.Second)
-	go c.periodicLog()
-	return c
-}
-
-func aggressivelyEvict() {
-	// Okay, we exceed the max memory threshold.
-	// Stop the world, and deal with this first.
-	megs := getMemUsage()
-	log.Printf("Memory usage over threshold. STW. Allocated MB: %v\n", megs)
-
-	log.Println("Aggressive evict, committing to RocksDB")
-	CommitLists(1)
-
-	log.Println("Trying to free OS memory")
-	// Forces garbage collection followed by returning as much memory to the OS
-	// as possible.
-	debug.FreeOSMemory()
-
-	megs = getMemUsage()
-	log.Printf("EVICT DONE! Memory usage after calling GC. Allocated MB: %v", megs)
-}
-
-func gentleCommit(dirtyMap map[uint64]struct{}, pending chan struct{}) {
-	select {
-	case pending <- struct{}{}:
-	default:
-		fmt.Println("Skipping gentleCommit")
-		return
-	}
-
-	// NOTE: No need to acquire read lock for stopTheWorld. This portion is being run
-	// serially alongside aggressive commit.
-	n := int(float64(len(dirtyMap)) * *commitFraction)
-	if n < 1000 {
-		// Have a min value of n, so we can merge small number of dirty PLs fast.
-		n = 1000
-	}
-	keysBuffer := make([]uint64, 0, n)
-
-	for key := range dirtyMap {
-		delete(dirtyMap, key)
-		keysBuffer = append(keysBuffer, key)
-		if len(keysBuffer) >= n {
-			// We don't want to process the entire dirtyMap in one go.
-			break
+func init() {
+	x.AddInit(func() {
+		h := md5.New()
+		pl := intern.PostingList{
+			Checksum: h.Sum(nil),
 		}
-	}
-
-	go func(keys []uint64) {
-		defer func() { <-pending }()
-		if len(keys) == 0 {
-			return
-		}
-		ctr := newCounters()
-		defer ctr.ticker.Stop()
-
-		for _, key := range keys {
-			l, ok := lhmap.Get(key)
-			if !ok || l == nil {
-				continue
-			}
-			// Not removing the postings list from the map, to avoid a race condition,
-			// where another caller re-creates the posting list before a commit happens.
-			commitOne(l, ctr)
-		}
-		ctr.log()
-	}(keysBuffer)
+		var err error
+		dummyPostingList, err = pl.Marshal()
+		x.Check(err)
+	})
+	elog = trace.NewEventLog("Memory", "")
 }
 
-// periodicMerging periodically merges the dirty posting lists. It also checks our memory
-// usage. If it exceeds a certain threshold, it would stop the world, and aggressively
-// merge and evict all posting lists from memory.
-func periodicCommit() {
-	ticker := time.NewTicker(5 * time.Second)
-	dirtyMap := make(map[uint64]struct{}, 1000)
-	// pending is used to ensure that we only have up to 15 goroutines doing gentle commits.
-	pending := make(chan struct{}, 15)
-	dsize := 0 // needed for better reporting.
-	for {
-		select {
-		case key := <-dirtyChan:
-			dirtyMap[key] = struct{}{}
-
-		case <-ticker.C:
-			if len(dirtyMap) != dsize {
-				dsize = len(dirtyMap)
-				log.Printf("Dirty map size: %d\n", dsize)
-			}
-
-			totMemory := getMemUsage()
-			if totMemory <= *maxmemory {
-				gentleCommit(dirtyMap, pending)
-				break
-			}
-
-			// Do aggressive commit, which would delete all the PLs from memory.
-			// Acquire lock, so no new posting lists are given out.
-			stopTheWorld.Lock()
-		DIRTYLOOP:
-			// Flush out the dirtyChan after acquiring lock. This allow posting lists which
-			// are currently being processed to not get stuck on dirtyChan, which won't be
-			// processed until aggressive evict finishes.
-			for {
-				select {
-				case <-dirtyChan:
-					// pass
-				default:
-					break DIRTYLOOP
-				}
-			}
-			aggressivelyEvict()
-			for k := range dirtyMap {
-				delete(dirtyMap, k)
-			}
-			stopTheWorld.Unlock()
-		}
-	}
-}
-
-// getMemUsage returns the amount of memory used by the process in MB
 func getMemUsage() int {
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	megs := ms.Alloc / (1 << 20)
-	return int(megs)
-
-	// Sticking to ms.Alloc temoprarily.
-	// TODO(Ashwin): Switch to total Memory(RSS) once we figure out
-	// how to release memory to OS (Currently only a small chunk
-	// is returned)
 	if runtime.GOOS != "linux" {
 		pid := os.Getpid()
 		cmd := fmt.Sprintf("ps -ao rss,pid | grep %v", pid)
@@ -260,7 +82,7 @@ func getMemUsage() int {
 			// In case of error running the command, resort to go way
 			var ms runtime.MemStats
 			runtime.ReadMemStats(&ms)
-			megs := ms.Alloc / (1 << 20)
+			megs := ms.Alloc
 			return int(megs)
 		}
 
@@ -270,13 +92,13 @@ func getMemUsage() int {
 			return 0
 		}
 
-		megs := kbs / (1 << 10)
+		megs := kbs << 10
 		return megs
 	}
 
 	contents, err := ioutil.ReadFile("/proc/self/stat")
 	if err != nil {
-		log.Println("Can't read the proc file", err)
+		x.Println("Can't read the proc file", err)
 		return 0
 	}
 
@@ -284,185 +106,160 @@ func getMemUsage() int {
 	// 24th entry of the file is the RSS which denotes the number of pages
 	// used by the process.
 	if len(cont) < 24 {
-		log.Println("Error in RSS from stat")
+		x.Println("Error in RSS from stat")
 		return 0
 	}
 
 	rss, err := strconv.Atoi(cont[23])
 	if err != nil {
-		log.Println(err)
+		x.Println(err)
 		return 0
 	}
 
-	return rss * os.Getpagesize() / (1 << 20)
+	return rss * os.Getpagesize()
+}
+
+func periodicUpdateStats() {
+	ticker := time.NewTicker(time.Second)
+	setLruMemory := true
+	for {
+		select {
+
+		case <-ticker.C:
+
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			megs := (ms.HeapInuse + ms.StackInuse) / (1 << 20)
+			inUse := float64(megs)
+
+			stats := lcache.Stats()
+			x.EvictedPls.Set(int64(stats.NumEvicts))
+			x.LcacheSize.Set(int64(stats.Size))
+			x.LcacheLen.Set(int64(stats.Length))
+
+			// Okay, we exceed the max memory threshold.
+			// Stop the world, and deal with this first.
+			x.NumGoRoutines.Set(int64(runtime.NumGoroutine()))
+			Config.Mu.Lock()
+			mem := Config.AllottedMemory
+			Config.Mu.Unlock()
+			if setLruMemory && inUse > 0.75*mem {
+				lcache.UpdateMaxSize()
+				setLruMemory = false
+			}
+		}
+	}
+}
+
+func updateMemoryMetrics() {
+	ticker := time.NewTicker(time.Minute)
+	for range ticker.C {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		megs := (ms.HeapInuse + ms.StackInuse)
+
+		inUse := float64(megs)
+		idle := float64(ms.HeapIdle - ms.HeapReleased)
+
+		x.MemoryInUse.Set(int64(inUse))
+		x.HeapIdle.Set(int64(idle))
+		x.TotalOSMemory.Set(int64(getMemUsage()))
+	}
 }
 
 var (
-	stopTheWorld sync.RWMutex
-	lhmap        *listMap
-	pstore       *store.Store
-	commitCh     chan commitEntry
+	pstore *badger.ManagedDB
+	lcache *listCache
 )
 
-func StartCommit() {
-	startCommitOnce.Do(func() {
-		fmt.Println("Starting commit routine.")
-		commitCh = make(chan commitEntry, 10000)
-		go batchCommit()
-	})
-}
-
 // Init initializes the posting lists package, the in memory and dirty list hash.
-func Init(ps *store.Store) {
+func Init(ps *badger.ManagedDB) {
 	pstore = ps
-	initIndex()
-	lhmap = newShardedListMap(*lhmapNumShards)
-	dirtyChan = make(chan uint64, 10000)
-	StartCommit()
-	go periodicCommit()
+	lcache = newListCache(math.MaxUint64)
+	x.LcacheCapacity.Set(math.MaxInt64)
+
+	go periodicUpdateStats()
+	go updateMemoryMetrics()
 }
 
-func getFromMap(key uint64) *List {
-	lp, _ := lhmap.Get(key)
-	if lp == nil {
-		return nil
-	}
-	lp.incr()
-	return lp
+func StopLRUEviction() {
+	atomic.StoreInt32(&lcache.done, 1)
 }
 
-// GetOrCreate stores the List corresponding to key, if it's not there already.
-// to lhmap and returns it. It also returns a reference decrement function to be called by caller.
+// Get stores the List corresponding to key, if it's not there already.
+// to lru cache and returns it.
 //
-// plist, decr := GetOrCreate(key, store)
-// defer decr()
+// plist := Get(key, group)
 // ... // Use plist
 // TODO: This should take a node id and index. And just append all indices to a list.
 // When doing a commit, it should update all the sync index watermarks.
 // worker pkg would push the indices to the watermarks held by lists.
 // And watermark stuff would have to be located outside worker pkg, maybe in x.
 // That way, we don't have a dependency conflict.
-func GetOrCreate(key []byte, group uint32) (rlist *List, decr func()) {
-	fp := farm.Fingerprint64(key)
-
-	stopTheWorld.RLock()
-	defer stopTheWorld.RUnlock()
-
-	lp, _ := lhmap.Get(fp)
+func Get(key []byte) (rlist *List) {
+	lp := lcache.Get(string(key))
 	if lp != nil {
-		lp.incr()
-		return lp, lp.decr
+		x.CacheHit.Add(1)
+		return lp
 	}
+	x.CacheMiss.Add(1)
 
-	l := getNew(key, pstore) // This retrieves a new *List and sets refcount to 1.
-	lp = lhmap.PutIfMissing(fp, l)
-	// We are always going to return lp to caller, whether it is l or not. So, let's
-	// increment its reference counter.
-	lp.incr()
-
+	// Any initialization for l must be done before PutIfMissing. Once it's added
+	// to the map, any other goroutine can retrieve it.
+	l, _ := getNew(key, pstore)
+	// We are always going to return lp to caller, whether it is l or not
+	lp = lcache.PutIfMissing(string(key), l)
 	if lp != l {
-		// Undo the increment in getNew() call above.
-		l.decr()
+		x.CacheRace.Add(1)
 	}
-	lp.water = marks.Get(group)
-	return lp, lp.decr
+	return lp
 }
 
-func commitOne(l *List, c *counters) {
-	if l == nil {
-		return
+// GetNoStore takes a key. It checks if the in-memory map has an updated value and returns it if it exists
+// or it gets from the store and DOES NOT ADD to lru cache.
+func GetNoStore(key []byte) (rlist *List) {
+	lp := lcache.Get(string(key))
+	if lp != nil {
+		return lp
 	}
-	if merged, err := l.CommitIfDirty(context.Background()); err != nil {
-		log.Printf("Error while commiting dirty list: %v\n", err)
-	} else if merged {
-		atomic.AddUint64(&c.done, 1)
-	} else {
-		atomic.AddUint64(&c.noop, 1)
-	}
+	lp, _ = getNew(key, pstore) // This retrieves a new *List and sets refcount to 1.
+	return lp
 }
 
-func CommitLists(numRoutines int) {
-	c := newCounters()
-	defer c.ticker.Stop()
+// This doesn't sync, so call this only when you don't care about dirty posting lists in // memory(for example before populating snapshot) or after calling syncAllMarks
+func EvictLRU() {
+	lcache.Reset()
+}
 
-	// We iterate over lhmap, deleting keys and pushing values (List) into this
+func CommitLists(commit func(key []byte) bool) {
+	// We iterate over lru and pushing values (List) into this
 	// channel. Then goroutines right below will commit these lists to data store.
 	workChan := make(chan *List, 10000)
 
 	var wg sync.WaitGroup
-	for i := 0; i < numRoutines; i++ {
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for l := range workChan {
-				l.SetForDeletion() // No more AddMutation.
-				commitOne(l, c)
-				l.decr()
+				l.SyncIfDirty(false)
 			}
 		}()
 	}
 
-	lhmap.EachWithDelete(func(k uint64, l *List) {
-		if l == nil { // To be safe. Check might be unnecessary.
-			return
+	lcache.iterate(func(l *List) bool {
+		if commit(l.key) {
+			workChan <- l
 		}
-		// We lose one reference for deletion from lhmap. But we gain one reference
-		// for pushing into workChan. So no decr or incr here.
-		workChan <- l
+		return true
 	})
 	close(workChan)
 	wg.Wait()
-}
 
-// The following logic is used to batch up all the writes to RocksDB.
-type commitEntry struct {
-	key     []byte
-	val     []byte
-	water   *x.WaterMark
-	pending []uint64
-	sw      *x.SafeWait
-}
-
-func batchCommit() {
-	var entries []commitEntry
-	var loop uint64
-
-	b := pstore.NewWriteBatch()
-	defer b.Destroy()
-
-	for {
-		select {
-		case e := <-commitCh:
-			entries = append(entries, e)
-
-		default:
-			// default is executed if no other case is ready.
-			start := time.Now()
-			if len(entries) > 0 {
-				x.AssertTrue(b != nil)
-				loop++
-				fmt.Printf("[%4d] Writing batch of size: %v\n", loop, len(entries))
-				for _, e := range entries {
-					b.Put(e.key, e.val)
-				}
-				x.Checkf(pstore.WriteBatch(b), "Error while writing to RocksDB.")
-				b.Clear()
-
-				for _, e := range entries {
-					e.sw.Done()
-					if e.water != nil {
-						for _, index := range e.pending {
-							e.water.Ch <- x.Mark{Index: index, Done: true}
-						}
-					}
-				}
-				entries = entries[:0]
-			}
-			// Add a sleep clause to avoid a busy wait loop if there's no input to commitCh.
-			sleepFor := 10*time.Millisecond - time.Since(start)
-			if sleepFor > time.Millisecond {
-				time.Sleep(sleepFor)
-			}
-		}
-	}
+	// Consider using sync in syncIfDirty instead of async.
+	// Hacky solution for now, ensures that everything is flushed to disk before we return.
+	txn := pstore.NewTransactionAt(1, true)
+	defer txn.Discard()
+	txn.Set(x.DataKey("_dummy_", 0), nil)
+	txn.CommitAt(1, nil)
 }

@@ -1,336 +1,841 @@
 /*
- * Copyright 2016 Dgraph Labs, Inc.
+ * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * 		http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package posting
 
 import (
+	"bytes"
 	"context"
-	"sort"
+	"fmt"
+	"math"
 	"sync"
+	"time"
 
 	"golang.org/x/net/trace"
 
+	"github.com/dgraph-io/badger"
+	"github.com/dgryski/go-farm"
+
+	"github.com/dgraph-io/dgraph/protos/intern"
 	"github.com/dgraph-io/dgraph/schema"
-	"github.com/dgraph-io/dgraph/task"
+	"github.com/dgraph-io/dgraph/tok"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
 )
 
-// TokensTable tracks the keys / tokens / buckets for an indexed attribute.
-type TokensTable struct {
-	sync.RWMutex
-	key []string
-}
+const maxBatchSize = 32 * (1 << 20)
 
-var (
-	indexLog trace.EventLog
-	tables   map[string]*TokensTable
-)
-
-func init() {
-	indexLog = trace.NewEventLog("index", "Logger")
-}
-
-// initIndex initializes the index with the given data store.
-func initIndex() {
-	x.AssertTrue(pstore != nil)
-
-	// Initialize TokensTables.
-	indexedFields := schema.IndexedFields()
-	type resultStruct struct {
-		attr  string
-		table *TokensTable
-	}
-	results := make(chan resultStruct, len(indexedFields))
-
-	for _, attr := range indexedFields {
-		go func(attr string) {
-			table := &TokensTable{
-				key: make([]string, 0, 50),
-			}
-			pk := x.ParsedKey{
-				Attr: attr,
-			}
-			prefix := pk.IndexPrefix()
-
-			it := pstore.NewIterator()
-			defer it.Close()
-			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-				pki := x.Parse(it.Key().Data())
-				x.AssertTrue(pki.IsIndex())
-				x.AssertTrue(len(pki.Term) > 0)
-				table.push(pki.Term)
-			}
-			results <- resultStruct{attr, table}
-		}(attr)
-	}
-
-	tables = make(map[string]*TokensTable)
-	for i := 0; i < len(indexedFields); i++ {
-		r := <-results
-		tables[r.attr] = r.table
-	}
-
-}
+var emptyCountParams countParams
 
 // IndexTokens return tokens, without the predicate prefix and index rune.
-func IndexTokens(attr string, src types.Val) ([]string, error) {
-	schemaType := schema.TypeOf(attr)
-	if !schemaType.IsScalar() {
+func indexTokens(attr, lang string, src types.Val) ([]string, error) {
+	schemaType, err := schema.State().TypeOf(attr)
+	if err != nil || !schemaType.IsScalar() {
 		return nil, x.Errorf("Cannot index attribute %s of type object.", attr)
 	}
-	s := schemaType.(types.TypeID)
-	sv := types.ValueForType(s)
-	err := types.Convert(src, &sv)
+
+	if !schema.State().IsIndexed(attr) {
+		return nil, x.Errorf("Attribute %s is not indexed.", attr)
+	}
+	s := schemaType
+	sv, err := types.Convert(src, s)
 	if err != nil {
 		return nil, err
 	}
-	return types.IndexTokens(attr, sv)
+	// Schema will know the mapping from attr to tokenizer.
+	var tokens []string
+	tokenizers := schema.State().Tokenizer(attr)
+	for _, it := range tokenizers {
+		if tok.FtsTokenizerName("") == it.Name() && len(lang) > 0 {
+			newTokenizer, ok := tok.GetTokenizer(tok.FtsTokenizerName(lang))
+			if ok {
+				it = newTokenizer
+			} else {
+				return nil, x.Errorf("Tokenizer not available for language: %s", lang)
+			}
+		}
+		toks, err := tok.BuildTokens(sv.Value, it)
+		if err != nil {
+			return tokens, err
+		}
+		tokens = append(tokens, toks...)
+	}
+
+	return tokens, nil
 }
 
 // addIndexMutations adds mutation(s) for a single term, to maintain index.
 // t represents the original uid -> value edge.
-func addIndexMutations(ctx context.Context, t *task.DirectedEdge, p types.Val, op task.DirectedEdge_Op) {
+// TODO - See if we need to pass op as argument as t should already have Op.
+func (txn *Txn) addIndexMutations(ctx context.Context, t *intern.DirectedEdge, p types.Val,
+	op intern.DirectedEdge_Op) error {
 	attr := t.Attr
 	uid := t.Entity
 	x.AssertTrue(uid != 0)
-	tokens, err := IndexTokens(attr, p)
+	tokens, err := indexTokens(attr, t.GetLang(), p)
+
 	if err != nil {
 		// This data is not indexable
-		return
+		return err
 	}
 
 	// Create a value token -> uid edge.
-	edge := &task.DirectedEdge{
+	edge := &intern.DirectedEdge{
 		ValueId: uid,
 		Attr:    attr,
-		Label:   "idx",
 		Op:      op,
 	}
 
-	tokensTable := GetTokensTable(attr)
-	x.AssertTruef(tokensTable != nil, "TokensTable missing for attr %s", attr)
-
 	for _, token := range tokens {
-		addIndexMutation(ctx, edge, token)
-		if edge.Op == task.DirectedEdge_SET {
-			tokensTable.Add(token)
+		if err := txn.addIndexMutation(ctx, edge, token); err != nil {
+			return err
 		}
-	}
-}
-
-func addIndexMutation(ctx context.Context, edge *task.DirectedEdge, token string) {
-	key := x.IndexKey(edge.Attr, token)
-
-	var groupId uint32
-	if rv, ok := ctx.Value("raft").(x.RaftValue); ok {
-		groupId = rv.Group
-	}
-
-	plist, decr := GetOrCreate(key, groupId)
-	defer decr()
-
-	x.AssertTruef(plist != nil, "plist is nil [%s] %d %s",
-		token, edge.ValueId, edge.Attr)
-	_, err := plist.AddMutation(ctx, edge)
-	if err != nil {
-		x.TraceError(ctx, x.Wrapf(err,
-			"Error adding/deleting %s for attr %s entity %d: %v",
-			token, edge.Attr, edge.Entity))
-	}
-	indexLog.Printf("%s [%s] [%d] Term [%s]",
-		edge.Op, edge.Attr, edge.Entity, token)
-
-}
-
-// AddMutationWithIndex is AddMutation with support for indexing.
-func (l *List) AddMutationWithIndex(ctx context.Context, t *task.DirectedEdge) error {
-	x.AssertTruef(len(t.Attr) > 0,
-		"[%s] [%d] [%v] %d %d\n", t.Attr, t.Entity, t.Value, t.ValueId, t.Op)
-
-	var val types.Val
-	var verr error
-
-	doUpdateIndex := pstore != nil && (t.Value != nil) &&
-		schema.IsIndexed(t.Attr)
-	if doUpdateIndex {
-		// Check last posting for original value BEFORE any mutation actually happens.
-		val, verr = l.Value()
-	}
-	hasMutated, err := l.AddMutation(ctx, t)
-	if err != nil {
-		return err
-	}
-	if !hasMutated || !doUpdateIndex {
-		return nil
-	}
-
-	// Exact matches.
-	if verr == nil && val.Value != nil {
-		addIndexMutations(ctx, t, val, task.DirectedEdge_DEL)
-	}
-	if t.Op == task.DirectedEdge_SET {
-		p := types.Val{
-			Tid:   types.TypeID(t.ValueType),
-			Value: t.Value,
-		}
-		addIndexMutations(ctx, t, p, task.DirectedEdge_SET)
 	}
 	return nil
 }
 
-// GetTokensTable returns TokensTable for an indexed attribute.
-func GetTokensTable(attr string) *TokensTable {
-	x.AssertTruef(tables != nil,
-		"TokensTable uninitialized. You need to call InitIndex.")
-	return tables[attr]
+func (txn *Txn) addIndexMutation(ctx context.Context, edge *intern.DirectedEdge,
+	token string) error {
+	key := x.IndexKey(edge.Attr, token)
+
+	t := time.Now()
+	plist := Get(key)
+	if dur := time.Since(t); dur > time.Millisecond {
+		if tr, ok := trace.FromContext(ctx); ok {
+			tr.LazyPrintf("getOrMutate took %v", dur)
+		}
+	}
+
+	x.AssertTrue(plist != nil)
+	_, err := plist.AddMutation(ctx, txn, edge)
+	if err != nil {
+		if tr, ok := trace.FromContext(ctx); ok {
+			tr.LazyPrintf("Error adding/deleting %s for attr %s entity %d: %v",
+				token, edge.Attr, edge.Entity, err)
+		}
+		return err
+	}
+	x.PredicateStats.Add(fmt.Sprintf("i.%s", edge.Attr), 1)
+	return nil
 }
 
-// NewTokensTable returns a new TokensTable.
-func NewTokensTable() *TokensTable {
-	return &TokensTable{
-		key: make([]string, 0, 50),
+// countParams is sent to updateCount function. It is used to update the count index.
+// It deletes the uid from the key corresponding to <attr, countBefore> and adds it
+// to <attr, countAfter>.
+type countParams struct {
+	attr        string
+	countBefore int
+	countAfter  int
+	entity      uint64
+	reverse     bool
+}
+
+func (txn *Txn) addReverseMutationHelper(ctx context.Context, plist *List,
+	hasCountIndex bool, edge *intern.DirectedEdge) (countParams, error) {
+	countBefore, countAfter := 0, 0
+	plist.Lock()
+	defer plist.Unlock()
+	if hasCountIndex {
+		countBefore = plist.length(txn.StartTs, 0)
+		if countBefore == -1 {
+			return emptyCountParams, ErrTsTooOld
+		}
+	}
+	_, err := plist.addMutation(ctx, txn, edge)
+	if err != nil {
+		return emptyCountParams, err
+	}
+	if hasCountIndex {
+		countAfter = plist.length(txn.StartTs, 0)
+		if countAfter == -1 {
+			return emptyCountParams, ErrTsTooOld
+		}
+		return countParams{
+			attr:        edge.Attr,
+			countBefore: countBefore,
+			countAfter:  countAfter,
+			entity:      edge.Entity,
+			reverse:     true,
+		}, nil
+	}
+	return emptyCountParams, nil
+}
+
+func (txn *Txn) addReverseMutation(ctx context.Context, t *intern.DirectedEdge) error {
+	key := x.ReverseKey(t.Attr, t.ValueId)
+	plist := Get(key)
+
+	x.AssertTrue(plist != nil)
+	edge := &intern.DirectedEdge{
+		Entity:  t.ValueId,
+		ValueId: t.Entity,
+		Attr:    t.Attr,
+		Op:      t.Op,
+		Facets:  t.Facets,
+	}
+
+	hasCountIndex := schema.State().HasCount(t.Attr)
+	cp, err := txn.addReverseMutationHelper(ctx, plist, hasCountIndex, edge)
+	if err != nil {
+		if tr, ok := trace.FromContext(ctx); ok {
+			tr.LazyPrintf("Error adding/deleting reverse edge for attr %s entity %d: %v",
+				t.Attr, t.Entity, err)
+		}
+		return err
+	}
+	x.PredicateStats.Add(fmt.Sprintf("r.%s", edge.Attr), 1)
+
+	if hasCountIndex && cp.countAfter != cp.countBefore {
+		if err := txn.updateCount(ctx, cp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (l *List) handleDeleteAll(ctx context.Context, t *intern.DirectedEdge,
+	txn *Txn) error {
+	isReversed := schema.State().IsReversed(t.Attr)
+	isIndexed := schema.State().IsIndexed(t.Attr)
+	hasCount := schema.State().HasCount(t.Attr)
+	delEdge := &intern.DirectedEdge{
+		Attr:   t.Attr,
+		Op:     t.Op,
+		Entity: t.Entity,
+	}
+	// To calculate length of posting list. Used for deletion of count index.
+	var plen int
+	var iterErr error
+	l.Iterate(txn.StartTs, 0, func(p *intern.Posting) bool {
+		plen++
+		if isReversed {
+			// Delete reverse edge for each posting.
+			delEdge.ValueId = p.Uid
+			if err := txn.addReverseMutation(ctx, delEdge); err != nil {
+				iterErr = err
+				return false
+			}
+			return true
+		} else if isIndexed {
+			// Delete index edge of each posting.
+			p := types.Val{
+				Tid:   types.TypeID(p.ValType),
+				Value: p.Value,
+			}
+			if err := txn.addIndexMutations(ctx, t, p, intern.DirectedEdge_DEL); err != nil {
+				iterErr = err
+				return false
+			}
+		}
+		return true
+	})
+	if iterErr != nil {
+		return iterErr
+	}
+	if hasCount {
+		// Delete uid from count index. Deletion of reverses is taken care by addReverseMutation
+		// above.
+		if err := txn.updateCount(ctx, countParams{
+			attr:        t.Attr,
+			countBefore: plen,
+			countAfter:  0,
+			entity:      t.Entity,
+		}); err != nil {
+			return err
+		}
+	}
+
+	l.Lock()
+	defer l.Unlock()
+	_, err := l.addMutation(ctx, txn, t)
+	return err
+}
+
+func (txn *Txn) addCountMutation(ctx context.Context, t *intern.DirectedEdge, count uint32,
+	reverse bool) error {
+	key := x.CountKey(t.Attr, count, reverse)
+	plist := Get(key)
+
+	x.AssertTruef(plist != nil, "plist is nil [%s] %d",
+		t.Attr, t.ValueId)
+	_, err := plist.AddMutation(ctx, txn, t)
+	if err != nil {
+		if tr, ok := trace.FromContext(ctx); ok {
+			tr.LazyPrintf("Error adding/deleting count edge for attr %s count %d dst %d: %v",
+				t.Attr, count, t.ValueId, err)
+		}
+		return err
+	}
+	x.PredicateStats.Add(fmt.Sprintf("c.%s", t.Attr), 1)
+	return nil
+
+}
+
+func (txn *Txn) updateCount(ctx context.Context, params countParams) error {
+	edge := intern.DirectedEdge{
+		ValueId: params.entity,
+		Attr:    params.attr,
+		Op:      intern.DirectedEdge_DEL,
+	}
+	if err := txn.addCountMutation(ctx, &edge, uint32(params.countBefore),
+		params.reverse); err != nil {
+		return err
+	}
+
+	if params.countAfter > 0 {
+		edge.Op = intern.DirectedEdge_SET
+		if err := txn.addCountMutation(ctx, &edge, uint32(params.countAfter),
+			params.reverse); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (txn *Txn) addMutationHelper(ctx context.Context, l *List, doUpdateIndex bool,
+	hasCountIndex bool, t *intern.DirectedEdge) (types.Val, bool, countParams, error) {
+	var val types.Val
+	var found bool
+	var err error
+
+	t1 := time.Now()
+	l.Lock()
+	defer l.Unlock()
+	if dur := time.Since(t1); dur > time.Millisecond {
+		if tr, ok := trace.FromContext(ctx); ok {
+			tr.LazyPrintf("acquired lock %v %v %v", dur, t.Attr, t.Entity)
+		}
+	}
+
+	if doUpdateIndex {
+		// Check original value BEFORE any mutation actually happens.
+		if len(t.Lang) > 0 {
+			val, found, err = l.findValue(txn.StartTs, farm.Fingerprint64([]byte(t.Lang)))
+		} else {
+			val, found, err = l.findValue(txn.StartTs, math.MaxUint64)
+		}
+		if err != nil {
+			return val, found, emptyCountParams, err
+		}
+	}
+	countBefore, countAfter := 0, 0
+	if hasCountIndex {
+		countBefore = l.length(txn.StartTs, 0)
+		if countBefore == -1 {
+			return val, found, emptyCountParams, ErrTsTooOld
+		}
+	}
+	_, err = l.addMutation(ctx, txn, t)
+	if err != nil {
+		return val, found, emptyCountParams, err
+	}
+	if hasCountIndex {
+		countAfter = l.length(txn.StartTs, 0)
+		if countAfter == -1 {
+			return val, found, emptyCountParams, ErrTsTooOld
+		}
+		return val, found, countParams{
+			attr:        t.Attr,
+			countBefore: countBefore,
+			countAfter:  countAfter,
+			entity:      t.Entity,
+		}, nil
+	}
+	return val, found, emptyCountParams, nil
+}
+
+// AddMutationWithIndex is AddMutation with support for indexing. It also
+// supports reverse edges.
+func (l *List) AddMutationWithIndex(ctx context.Context, t *intern.DirectedEdge,
+	txn *Txn) error {
+	if len(t.Attr) == 0 {
+		return x.Errorf("Predicate cannot be empty for edge with subject: [%v], object: [%v]"+
+			" and value: [%v]", t.Entity, t.ValueId, t.Value)
+	}
+
+	if t.Op == intern.DirectedEdge_DEL && string(t.Value) == x.Star {
+		return l.handleDeleteAll(ctx, t, txn)
+	}
+
+	doUpdateIndex := pstore != nil && (t.Value != nil) && schema.State().IsIndexed(t.Attr)
+	hasCountIndex := schema.State().HasCount(t.Attr)
+	val, found, cp, err := txn.addMutationHelper(ctx, l, doUpdateIndex, hasCountIndex, t)
+	if err != nil {
+		return err
+	}
+	x.PredicateStats.Add(t.Attr, 1)
+	if hasCountIndex && cp.countAfter != cp.countBefore {
+		if err := txn.updateCount(ctx, cp); err != nil {
+			return err
+		}
+	}
+	// We should always set index set and we can take care of stale indexes in
+	// eventual index consistency
+	if doUpdateIndex {
+		// Exact matches.
+		if found && val.Value != nil {
+			if err := txn.addIndexMutations(ctx, t, val, intern.DirectedEdge_DEL); err != nil {
+				return err
+			}
+		}
+		if t.Op == intern.DirectedEdge_SET {
+			p := types.Val{
+				Tid:   types.TypeID(t.ValueType),
+				Value: t.Value,
+			}
+			if err := txn.addIndexMutations(ctx, t, p, intern.DirectedEdge_SET); err != nil {
+				return err
+			}
+		}
+	}
+	// Add reverse mutation irrespective of hasMutated, server crash can happen after
+	// mutation is synced and before reverse edge is synced
+	if (pstore != nil) && (t.ValueId != 0) && schema.State().IsReversed(t.Attr) {
+		if err := txn.addReverseMutation(ctx, t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func deleteEntries(prefix []byte) error {
+	iterOpt := badger.DefaultIteratorOptions
+	iterOpt.PrefetchValues = false
+	txn := pstore.NewTransactionAt(math.MaxUint64, false)
+	defer txn.Discard()
+	idxIt := txn.NewIterator(iterOpt)
+	defer idxIt.Close()
+
+	// Throttle number of parallel purges.
+	pending := make(chan struct{}, 1000)
+	var m sync.Mutex
+	var err error
+	for idxIt.Seek(prefix); idxIt.ValidForPrefix(prefix); idxIt.Next() {
+		item := idxIt.Item()
+		nkey := make([]byte, len(item.Key()))
+		copy(nkey, item.Key())
+
+		pending <- struct{}{}
+		go func(key []byte, version uint64) {
+			e := pstore.PurgeVersionsBelow(key, version)
+			if e != nil {
+				m.Lock()
+				err = e
+				m.Unlock()
+			}
+			<-pending
+		}(nkey, item.Version()+1)
+	}
+	for i := 0; i < 1000; i++ {
+		pending <- struct{}{}
+	}
+	return err
+}
+
+func compareAttrAndType(key []byte, attr string, typ byte) bool {
+	pk := x.Parse(key)
+	if pk == nil {
+		return true
+	}
+	if pk.Attr == attr && pk.IsType(typ) {
+		return true
+	}
+	return false
+}
+
+func DeleteReverseEdges(ctx context.Context, attr string) error {
+	lcache.clear(func(key []byte) bool {
+		return compareAttrAndType(key, attr, x.ByteReverse)
+	})
+	// Delete index entries from data store.
+	pk := x.ParsedKey{Attr: attr}
+	prefix := pk.ReversePrefix()
+	if err := deleteEntries(prefix); err != nil {
+		return err
+	}
+	return nil
+}
+
+func deleteCountIndex(ctx context.Context, attr string, reverse bool) error {
+	pk := x.ParsedKey{Attr: attr}
+	prefix := pk.CountPrefix(reverse)
+	if err := deleteEntries(prefix); err != nil {
+		return err
+	}
+	return nil
+}
+
+func DeleteCountIndex(ctx context.Context, attr string) error {
+	lcache.clear(func(key []byte) bool {
+		return compareAttrAndType(key, attr, x.ByteCount)
+	})
+	lcache.clear(func(key []byte) bool {
+		return compareAttrAndType(key, attr, x.ByteCountRev)
+	})
+	// Delete index entries from data store.
+	if err := deleteCountIndex(ctx, attr, false); err != nil {
+		return err
+	}
+	if err := deleteCountIndex(ctx, attr, true); err != nil { // delete reverse count indexes.
+		return err
+	}
+	return nil
+}
+
+func rebuildCountIndex(ctx context.Context, attr string, reverse bool, doneCh chan struct{}, startTs uint64) {
+	ch := make(chan item, 10000)
+	che := make(chan error, 1000)
+	for i := 0; i < 1000; i++ {
+		go func() {
+			var err error
+			txn := &Txn{StartTs: startTs}
+			for it := range ch {
+				l := it.list
+				t := &intern.DirectedEdge{
+					ValueId: it.uid,
+					Attr:    attr,
+					Op:      intern.DirectedEdge_SET,
+				}
+				len := l.Length(txn.StartTs, 0)
+				if len == -1 {
+					continue
+				}
+				err = txn.addCountMutation(ctx, t, uint32(len), reverse)
+				for err == ErrRetry {
+					time.Sleep(10 * time.Millisecond)
+					err = txn.addCountMutation(ctx, t, uint32(len), reverse)
+				}
+				if err == nil {
+					err = txn.CommitMutationsMemory(ctx, txn.StartTs)
+				}
+				if err != nil {
+					txn.AbortMutations(ctx)
+				}
+				txn.deltas = nil
+			}
+			che <- err
+		}()
+	}
+
+	pk := x.ParsedKey{Attr: attr}
+	prefix := pk.DataPrefix()
+	if reverse {
+		prefix = pk.ReversePrefix()
+	}
+
+	t := pstore.NewTransactionAt(startTs, false)
+	defer t.Discard()
+	iterOpts := badger.DefaultIteratorOptions
+	iterOpts.AllVersions = true
+	it := t.NewIterator(iterOpts)
+	defer it.Close()
+	var prevKey []byte
+	it.Seek(prefix)
+	for it.ValidForPrefix(prefix) {
+		iterItem := it.Item()
+		key := iterItem.Key()
+		if bytes.Equal(key, prevKey) {
+			it.Next()
+			continue
+		}
+		nk := make([]byte, len(key))
+		copy(nk, key)
+		prevKey = nk
+		pki := x.Parse(key)
+		if pki == nil {
+			it.Next()
+			continue
+		}
+		// readPostingList advances the iterator until it finds complete pl
+		l, err := ReadPostingList(nk, it)
+		if err != nil {
+			continue
+		}
+
+		ch <- item{
+			uid:  pki.Uid,
+			list: l,
+		}
+	}
+	close(ch)
+	for i := 0; i < 1000; i++ {
+		if err := <-che; err != nil {
+			x.Printf("Error while rebuilding count index %v\n", err)
+		}
+	}
+	doneCh <- struct{}{}
+}
+
+func RebuildCountIndex(ctx context.Context, attr string, startTs uint64) {
+	x.AssertTruef(schema.State().HasCount(attr), "Attr %s doesn't have count index", attr)
+	doneCh := make(chan struct{}, 2)
+	// Lets rebuild forward and reverse count indexes concurrently.
+	go rebuildCountIndex(ctx, attr, false, doneCh, startTs)
+	go rebuildCountIndex(ctx, attr, true, doneCh, startTs)
+
+	for i := 0; i < 2; i++ {
+		<-doneCh
 	}
 }
 
-// Get returns position of element. If not found, it returns -1.
-func (t *TokensTable) Get(s string) int {
-	t.RLock()
-	defer t.RUnlock()
-	i := sort.SearchStrings(t.key, s)
-	if i < len(t.key) && t.key[i] == s {
-		return i
+type item struct {
+	uid  uint64
+	list *List
+}
+
+// RebuildReverseEdges rebuilds the reverse edges for a given attribute.
+func RebuildReverseEdges(ctx context.Context, attr string, startTs uint64) {
+	x.AssertTruef(schema.State().IsReversed(attr), "Attr %s doesn't have reverse", attr)
+	// Add index entries to data store.
+	pk := x.ParsedKey{Attr: attr}
+	prefix := pk.DataPrefix()
+	t := pstore.NewTransactionAt(startTs, false)
+	defer t.Discard()
+	iterOpts := badger.DefaultIteratorOptions
+	iterOpts.AllVersions = true
+	it := t.NewIterator(iterOpts)
+	defer it.Close()
+
+	// Helper function - Add reverse entries for values in posting list
+	addReversePostings := func(uid uint64, pl *List, txn *Txn) {
+		edge := intern.DirectedEdge{Attr: attr, Entity: uid}
+		var err error
+		pl.Iterate(txn.StartTs, 0, func(pp *intern.Posting) bool {
+			puid := pp.Uid
+			// Add reverse entries based on p.
+			edge.ValueId = puid
+			edge.Op = intern.DirectedEdge_SET
+			edge.Facets = pp.Facets
+			edge.Label = pp.Label
+			err = txn.addReverseMutation(ctx, &edge)
+			for err == ErrRetry {
+				time.Sleep(10 * time.Millisecond)
+				err = txn.addReverseMutation(ctx, &edge)
+			}
+			if err != nil {
+				x.Printf("Error while adding reverse mutation: %v\n", err)
+			}
+			return true
+		})
 	}
-	return -1
-}
 
-// Add increments counter for a given key. If it doesn't exist, we create a
-// new entry in TokensTable. We don't support delete yet. We are using a very
-// simple implementation. In the future, as balanced trees / skip lists
-// implementations become standardized for Go, we may consider using them.
-// We also didn't support Delete operations yet. For that, we need to store
-// the counts for each key.
-func (t *TokensTable) Add(s string) {
-	t.Lock()
-	defer t.Unlock()
-	i := sort.SearchStrings(t.key, s)
-	if i < len(t.key) && t.key[i] == s {
-		return
+	ch := make(chan item, 10000)
+	che := make(chan error, 1000)
+	for i := 0; i < 1000; i++ {
+		go func() {
+			var err error
+			txn := &Txn{StartTs: startTs}
+			for it := range ch {
+				addReversePostings(it.uid, it.list, txn)
+				err = txn.CommitMutationsMemory(ctx, txn.StartTs)
+				if err != nil {
+					txn.AbortMutations(ctx)
+				}
+				txn.deltas = nil
+			}
+			che <- err
+		}()
 	}
-	t.key = append(t.key, "")
-	for j := len(t.key) - 1; j > i; j-- {
-		t.key[j] = t.key[j-1]
+
+	var prevKey []byte
+	it.Seek(prefix)
+	for it.ValidForPrefix(prefix) {
+		iterItem := it.Item()
+		key := iterItem.Key()
+		if bytes.Equal(key, prevKey) {
+			it.Next()
+			continue
+		}
+		nk := make([]byte, len(key))
+		copy(nk, key)
+		prevKey = nk
+		pki := x.Parse(key)
+		if pki == nil {
+			it.Next()
+			continue
+		}
+		l, err := ReadPostingList(nk, it)
+		if err != nil {
+			continue
+		}
+
+		ch <- item{
+			uid:  pki.Uid,
+			list: l,
+		}
 	}
-	t.key[i] = s
-}
-
-// push appends a key to the table. It assumes that this key is the largest
-// and that order is preserved.
-func (t *TokensTable) push(s string) {
-	t.Lock()
-	defer t.Unlock()
-	t.key = append(t.key, s)
-}
-
-// Size returns size of TokensTable.
-func (t *TokensTable) Size() int {
-	t.RLock()
-	defer t.RUnlock()
-	return len(t.key)
-}
-
-// KeysForTest returns keys for a table. This is just for testing / debugging.
-func KeysForTest(attr string) []string {
-	t := GetTokensTable(attr)
-	t.RLock()
-	defer t.RUnlock()
-	return t.key
-}
-
-// GetNext returns the next key after given key. If we reach the end, we
-// return an empty string.
-func (t *TokensTable) GetNext(key string) string {
-	t.RLock()
-	defer t.RUnlock()
-	i := sort.Search(len(t.key),
-		func(i int) bool { return t.key[i] > key })
-	if i < len(t.key) {
-		return t.key[i]
+	close(ch)
+	for i := 0; i < 1000; i++ {
+		if err := <-che; err != nil {
+			x.Printf("Error while committing: %v\n", err)
+		}
 	}
-	return ""
 }
 
-// GetFirst returns the first key in our list of keys. You could also call
-// GetNext("") but that is less efficient.
-func (t *TokensTable) GetFirst() string {
-	t.RLock()
-	defer t.RUnlock()
-	if len(t.key) == 0 {
-		// Assume all keys are nonempty. Returning empty string means there's no keys.
-		return ""
+func DeleteIndex(ctx context.Context, attr string) error {
+	lcache.clear(func(key []byte) bool {
+		return compareAttrAndType(key, attr, x.ByteIndex)
+	})
+	// Delete index entries from data store.
+	pk := x.ParsedKey{Attr: attr}
+	prefix := pk.IndexPrefix()
+	if err := deleteEntries(prefix); err != nil {
+		return err
 	}
-	return t.key[0]
+	return nil
 }
 
-// GetPrev returns the key just before the given key. If we reach the start,
-// we return an empty string.
-func (t *TokensTable) GetPrev(key string) string {
-	t.RLock()
-	defer t.RUnlock()
-	n := len(t.key)
-	i := sort.Search(len(t.key),
-		func(i int) bool { return t.key[n-i-1] < key })
-	if i < len(t.key) {
-		return t.key[n-i-1]
+// RebuildIndex rebuilds index for a given attribute.
+// We commit mutations with startTs and ignore the errors.
+func RebuildIndex(ctx context.Context, attr string, startTs uint64) {
+	x.AssertTruef(schema.State().IsIndexed(attr), "Attr %s not indexed", attr)
+	// Add index entries to data store.
+	pk := x.ParsedKey{Attr: attr}
+	prefix := pk.DataPrefix()
+	t := pstore.NewTransactionAt(startTs, false)
+	defer t.Discard()
+	iterOpts := badger.DefaultIteratorOptions
+	iterOpts.AllVersions = true
+	it := t.NewIterator(iterOpts)
+	defer it.Close()
+
+	// Helper function - Add index entries for values in posting list
+	addPostingsToIndex := func(uid uint64, pl *List, txn *Txn) {
+		edge := intern.DirectedEdge{Attr: attr, Entity: uid}
+		var err error
+		pl.Iterate(txn.StartTs, 0, func(p *intern.Posting) bool {
+			// Add index entries based on p.
+			val := types.Val{
+				Value: p.Value,
+				Tid:   types.TypeID(p.ValType),
+			}
+			err = txn.addIndexMutations(ctx, &edge, val, intern.DirectedEdge_SET)
+			for err == ErrRetry {
+				time.Sleep(10 * time.Millisecond)
+				err = txn.addIndexMutations(ctx, &edge, val, intern.DirectedEdge_SET)
+			}
+			if err != nil {
+				x.Printf("Error while adding index mutation: %v\n", err)
+			}
+			return true
+		})
 	}
-	return ""
+
+	type item struct {
+		uid  uint64
+		list *List
+	}
+	ch := make(chan item, 10000)
+	che := make(chan error, 1000)
+	for i := 0; i < 1000; i++ {
+		go func() {
+			var err error
+			txn := &Txn{StartTs: startTs}
+			for it := range ch {
+				addPostingsToIndex(it.uid, it.list, txn)
+				err = txn.CommitMutationsMemory(ctx, txn.StartTs)
+				if err != nil {
+					txn.AbortMutations(ctx)
+				}
+				txn.deltas = nil
+			}
+			che <- err
+		}()
+	}
+
+	var prevKey []byte
+	it.Seek(prefix)
+	for it.ValidForPrefix(prefix) {
+		iterItem := it.Item()
+		key := iterItem.Key()
+		if bytes.Equal(key, prevKey) {
+			it.Next()
+			continue
+		}
+		nk := make([]byte, len(key))
+		copy(nk, key)
+		prevKey = nk
+		pki := x.Parse(key)
+		if pki == nil {
+			it.Next()
+			continue
+		}
+		l, err := ReadPostingList(nk, it)
+		if err != nil {
+			continue
+		}
+
+		ch <- item{
+			uid:  pki.Uid,
+			list: l,
+		}
+	}
+	close(ch)
+	for i := 0; i < 1000; i++ {
+		if err := <-che; err != nil {
+			x.Printf("Error while committing: %v\n", err)
+		}
+	}
 }
 
-// GetLast returns the first key in our list of keys. You could also call
-// GetPrev("") but that is less efficient.
-func (t *TokensTable) GetLast() string {
-	t.RLock()
-	defer t.RUnlock()
-	if len(t.key) == 0 {
-		// Assume all keys are nonempty. Returning empty string means there's no keys.
-		return ""
-	}
-	return t.key[len(t.key)-1]
+func DeleteAll() error {
+	lcache.clear(func([]byte) bool { return true })
+	return deleteEntries(nil)
 }
 
-// GetNextOrEqual returns position of leftmost element that is greater or equal to s.
-func (t *TokensTable) GetNextOrEqual(s string) string {
-	t.RLock()
-	defer t.RUnlock()
-	n := len(t.key)
-	i := sort.Search(n, func(i int) bool { return t.key[i] >= s })
-	if i < n {
-		return t.key[i]
+func DeletePredicate(ctx context.Context, attr string) error {
+	lcache.clear(func(key []byte) bool {
+		return compareAttrAndType(key, attr, x.ByteData)
+	})
+	pk := x.ParsedKey{
+		Attr: attr,
 	}
-	return ""
-}
+	prefix := pk.DataPrefix()
+	// Delete all data postings for the given predicate.
+	if err := deleteEntries(prefix); err != nil {
+		return err
+	}
 
-// GetPrevOrEqual returns position of rightmost element that is smaller or equal to s.
-func (t *TokensTable) GetPrevOrEqual(s string) string {
-	t.RLock()
-	defer t.RUnlock()
-	n := len(t.key)
-	i := sort.Search(n, func(i int) bool { return t.key[n-i-1] <= s })
-	if i < n {
-		return t.key[n-i-1]
+	// TODO - We will still have the predicate present in <uid, _predicate_> posting lists.
+	indexed := schema.State().IsIndexed(attr)
+	reversed := schema.State().IsReversed(attr)
+	if indexed {
+		if err := DeleteIndex(ctx, attr); err != nil {
+			return err
+		}
+	} else if reversed {
+		if err := DeleteReverseEdges(ctx, attr); err != nil {
+			return err
+		}
 	}
-	return ""
+
+	hasCountIndex := schema.State().HasCount(attr)
+	if hasCountIndex {
+		if err := DeleteCountIndex(ctx, attr); err != nil {
+			return err
+		}
+	}
+
+	s, ok := schema.State().Get(attr)
+	if !ok {
+		return nil
+	}
+	if !s.Explicit {
+		schema.State().Delete(attr)
+	}
+	return nil
 }

@@ -1,240 +1,317 @@
 /*
- * Copyright 2016 DGraph Labs, Inc.
+ * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package schema
 
 import (
-	"io/ioutil"
+	"strings"
 
 	"github.com/dgraph-io/dgraph/lex"
+	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/tok"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
 )
 
-func run(l *lex.Lexer) {
-	for state := lexText; state != nil; {
-		state = state(l)
+// ParseBytes parses the byte array which holds the schema. We will reset
+// all the globals.
+// Overwrites schema blindly - called only during initilization in testing
+func ParseBytes(s []byte, gid uint32) (rerr error) {
+	if pstate == nil {
+		reset()
 	}
-	close(l.Items) // No more tokens.
-}
-
-// Parse parses the schema file.
-func Parse(file string) (rerr error) {
-	b, err := ioutil.ReadFile(file)
+	pstate.DeleteAll()
+	updates, err := Parse(string(s))
 	if err != nil {
-		return x.Errorf("Error reading file: %v", err)
+		return err
 	}
-	return ParseBytes(b)
+
+	for _, update := range updates {
+		State().Set(update.Predicate, *update)
+	}
+	State().Set("_predicate_", intern.SchemaUpdate{
+		ValueType: intern.Posting_STRING,
+		List:      true,
+	})
+	return nil
 }
 
-// ParseBytes parses the byte array which holds the schema.
-func ParseBytes(schema []byte) (rerr error) {
-	s := string(schema)
-
-	l := &lex.Lexer{}
-	l.Init(s)
-	go run(l)
-
-	for item := range l.Items {
-		switch item.Typ {
-		case itemScalar:
-			{
-				if rerr = processScalar(l); rerr != nil {
-					return rerr
-				}
-			}
-		case itemType:
-			{
-				if rerr = processObject(l); rerr != nil {
-					return rerr
-				}
-			}
-		case lex.ItemError:
-			return x.Errorf(item.Val)
+func parseDirective(it *lex.ItemIterator, schema *intern.SchemaUpdate, t types.TypeID) error {
+	it.Next()
+	next := it.Item()
+	if next.Typ != itemText {
+		return x.Errorf("Missing directive name")
+	}
+	switch next.Val {
+	case "reverse":
+		if t != types.UidID {
+			return x.Errorf("Cannot reverse for non-UID type")
 		}
+		schema.Directive = intern.SchemaUpdate_REVERSE
+	case "index":
+		if tokenizer, err := parseIndexDirective(it, schema.Predicate, t); err != nil {
+			return err
+		} else {
+			schema.Directive = intern.SchemaUpdate_INDEX
+			schema.Tokenizer = tokenizer
+		}
+	case "count":
+		schema.Count = true
+	default:
+		return x.Errorf("Invalid index specification")
+	}
+	it.Next()
+
+	return nil
+}
+
+func parseScalarPair(it *lex.ItemIterator, predicate string) (*intern.SchemaUpdate,
+	error) {
+	it.Next()
+	if next := it.Item(); next.Typ != itemColon {
+		return nil, x.Errorf("Missing colon")
 	}
 
-	for _, v := range str {
-		if obj, ok := v.(types.Object); ok {
-			for p, q := range obj.Fields {
-				typ := TypeOf(q)
-				if typ == nil {
-					return x.Errorf("Type not defined %v", q)
+	if !it.Next() {
+		return nil, x.Errorf("Invalid ending while trying to parse schema.")
+	}
+	next := it.Item()
+	schema := &intern.SchemaUpdate{Predicate: predicate, Explicit: true}
+	// Could be list type.
+	if next.Typ == itemLeftSquare {
+		schema.List = true
+		if !it.Next() {
+			return nil, x.Errorf("Invalid ending while trying to parse schema.")
+		}
+		next = it.Item()
+	}
+
+	if next.Typ != itemText {
+		return nil, x.Errorf("Missing Type")
+	}
+	typ := strings.ToLower(next.Val)
+	// We ignore the case for types.
+	t, ok := types.TypeForName(typ)
+	if !ok {
+		return nil, x.Errorf("Undefined Type")
+	}
+	if schema.List {
+		if !t.IsScalar() {
+			return nil, x.Errorf("Expected scalar type inside []. Got: [%s] for attr: [%s].",
+				t.Name(), predicate)
+		}
+		if uint32(t) == uint32(types.PasswordID) || uint32(t) == uint32(types.BoolID) {
+			return nil, x.Errorf("Unsupported type for list: [%s].", types.TypeID(t).Name())
+		}
+	}
+	schema.ValueType = t.Enum()
+
+	// Check for index / reverse.
+	it.Next()
+	next = it.Item()
+	if schema.List {
+		if next.Typ != itemRightSquare {
+			return nil, x.Errorf("Unclosed [ while parsing schema for: %s", predicate)
+		}
+		if !it.Next() {
+			return nil, x.Errorf("Invalid ending")
+		}
+		next = it.Item()
+	}
+	if next.Typ == itemAt {
+		if err := parseDirective(it, schema, t); err != nil {
+			return nil, err
+		}
+		next = it.Item()
+	}
+	// Check for another directive, we could have @count too.
+	if next.Typ == itemAt {
+		if err := parseDirective(it, schema, t); err != nil {
+			return nil, err
+		}
+		next = it.Item()
+	}
+	if next.Typ != itemDot {
+		return nil, x.Errorf("Invalid ending")
+	}
+	it.Next()
+	next = it.Item()
+	if next.Typ == lex.ItemEOF {
+		it.Prev()
+		return schema, nil
+	}
+	if next.Typ != itemNewLine {
+		return nil, x.Errorf("Invalid ending")
+	}
+	return schema, nil
+}
+
+// parseIndexDirective works on "@index" or "@index(customtokenizer)".
+func parseIndexDirective(it *lex.ItemIterator, predicate string,
+	typ types.TypeID) ([]string, error) {
+	var tokenizers []string
+	var seen = make(map[string]bool)
+	var seenSortableTok bool
+
+	if typ == types.UidID || typ == types.DefaultID || typ == types.PasswordID {
+		return tokenizers, x.Errorf("Indexing not allowed on predicate %s of type %s",
+			predicate, typ.Name())
+	}
+	if !it.Next() {
+		// Nothing to read.
+		return []string{}, x.Errorf("Invalid ending.")
+	}
+	next := it.Item()
+	if next.Typ != itemLeftRound {
+		it.Prev() // Backup.
+		return []string{}, x.Errorf("Require type of tokenizer for pred: %s for indexing.",
+			predicate)
+	}
+
+	expectArg := true
+	// Look for tokenizers.
+	for {
+		it.Next()
+		next = it.Item()
+		if next.Typ == itemRightRound {
+			break
+		}
+		if next.Typ == itemComma {
+			if expectArg {
+				return nil, x.Errorf("Expected a tokenizer but got comma")
+			}
+			expectArg = true
+			continue
+		}
+		if next.Typ != itemText {
+			return tokenizers, x.Errorf("Expected directive arg but got: %v", next.Val)
+		}
+		if !expectArg {
+			return tokenizers, x.Errorf("Expected a comma but got: %v", next)
+		}
+		// Look for custom tokenizer.
+		tokenizer, has := tok.GetTokenizer(strings.ToLower(next.Val))
+		if !has {
+			return tokenizers, x.Errorf("Invalid tokenizer %s", next.Val)
+		}
+		tokenizerType, ok := types.TypeForName(tokenizer.Type())
+		x.AssertTrue(ok) // Type is validated during tokenizer loading.
+		if tokenizerType != typ {
+			return tokenizers,
+				x.Errorf("Tokenizer: %s isn't valid for predicate: %s of type: %s",
+					tokenizer.Name(), predicate, typ.Name())
+		}
+		if _, found := seen[tokenizer.Name()]; found {
+			return tokenizers, x.Errorf("Duplicate tokenizers defined for pred %v",
+				predicate)
+		}
+		if tokenizer.IsSortable() {
+			if seenSortableTok {
+				return nil, x.Errorf("More than one sortable index encountered for: %v",
+					predicate)
+			}
+			seenSortableTok = true
+		}
+		tokenizers = append(tokenizers, tokenizer.Name())
+		seen[tokenizer.Name()] = true
+		expectArg = false
+	}
+	return tokenizers, nil
+}
+
+// resolveTokenizers resolves default tokenizers and verifies tokenizers definitions.
+func resolveTokenizers(updates []*intern.SchemaUpdate) error {
+	for _, schema := range updates {
+		typ := types.TypeID(schema.ValueType)
+
+		if (typ == types.UidID || typ == types.DefaultID || typ == types.PasswordID) &&
+			schema.Directive == intern.SchemaUpdate_INDEX {
+			return x.Errorf("Indexing not allowed on predicate %s of type %s",
+				schema.Predicate, typ.Name())
+		}
+
+		if typ == types.UidID {
+			continue
+		}
+
+		if len(schema.Tokenizer) == 0 && schema.Directive == intern.SchemaUpdate_INDEX {
+			return x.Errorf("Require type of tokenizer for pred: %s of type: %s for indexing.",
+				schema.Predicate, typ.Name())
+		} else if len(schema.Tokenizer) > 0 && schema.Directive != intern.SchemaUpdate_INDEX {
+			return x.Errorf("Tokenizers present without indexing on attr %s", schema.Predicate)
+		}
+		// check for valid tokeniser types and duplicates
+		var seen = make(map[string]bool)
+		var seenSortableTok bool
+		for _, t := range schema.Tokenizer {
+			tokenizer, has := tok.GetTokenizer(t)
+			if !has {
+				return x.Errorf("Invalid tokenizer %s", t)
+			}
+			tokenizerType, ok := types.TypeForName(tokenizer.Type())
+			x.AssertTrue(ok) // Type is validated during tokenizer loading.
+			if tokenizerType != typ {
+				return x.Errorf("Tokenizer: %s isn't valid for predicate: %s of type: %s",
+					tokenizer.Name(), schema.Predicate, typ.Name())
+			}
+			if _, ok := seen[tokenizer.Name()]; !ok {
+				seen[tokenizer.Name()] = true
+			} else {
+				return x.Errorf("Duplicate tokenizers present for attr %s", schema.Predicate)
+			}
+			if tokenizer.IsSortable() {
+				if seenSortableTok {
+					return x.Errorf("More than one sortable index encountered for: %v",
+						schema.Predicate)
 				}
-				if typ != nil && !typ.IsScalar() {
-					str[p] = typ
-				}
+				seenSortableTok = true
 			}
 		}
 	}
 	return nil
 }
 
-func processScalarBlock(l *lex.Lexer) error {
-	for item := range l.Items {
+// Parse parses a schema string and returns the schema representation for it.
+func Parse(s string) ([]*intern.SchemaUpdate, error) {
+	var schemas []*intern.SchemaUpdate
+	l := lex.Lexer{Input: s}
+	l.Run(lexText)
+	it := l.NewIterator()
+	for it.Next() {
+		item := it.Item()
 		switch item.Typ {
-		case itemRightRound:
-			return nil
-		case itemScalarName:
-			{
-				var name, typ string
-				name = item.Val
-
-				if next := <-l.Items; next.Typ != itemCollon {
-					return x.Errorf("Missing collon")
-				}
-
-				next := <-l.Items
-				if next.Typ != itemScalarType {
-					return x.Errorf("Missing Type")
-				}
-				typ = next.Val
-
-				t, ok := getScalar(typ)
-				if !ok {
-					return x.Errorf("Invalid type")
-				}
-				str[name] = t
-
-				// Check for index.
-				next = <-l.Items
-				if next.Typ == itemAt {
-					index := <-l.Items
-					if index.Typ == itemIndex {
-						indexedFields[name] = true
-					} else {
-						return x.Errorf("Invalid index specification")
-					}
-				}
+		case lex.ItemEOF:
+			if err := resolveTokenizers(schemas); err != nil {
+				return nil, x.Wrapf(err, "failed to enrich schema")
+			}
+			return schemas, nil
+		case itemText:
+			if schema, err := parseScalarPair(it, item.Val); err != nil {
+				return nil, err
+			} else {
+				schemas = append(schemas, schema)
 			}
 		case lex.ItemError:
-			return x.Errorf(item.Val)
+			return nil, x.Errorf(item.Val)
+		case itemNewLine:
+			// pass empty line
+		default:
+			return nil, x.Errorf("Unexpected token: %v while parsing schema", item)
 		}
 	}
-
-	return nil
-}
-
-func processScalar(l *lex.Lexer) error {
-	for item := range l.Items {
-		switch item.Typ {
-		case itemLeftRound:
-			{
-				return processScalarBlock(l)
-			}
-		case itemScalarName:
-			{
-				var name, typ string
-				name = item.Val
-
-				next := <-l.Items
-				if next.Typ != itemCollon {
-					return x.Errorf("Missing collon")
-				}
-
-				next = <-l.Items
-				if next.Typ != itemScalarType {
-					return x.Errorf("Missing Type")
-				}
-				typ = next.Val
-
-				if t, ok := getScalar(typ); ok {
-					str[name] = t
-				} else {
-					return x.Errorf("Invalid type")
-				}
-
-				// Check for index.
-				next = <-l.Items
-				if next.Typ == itemAt {
-					index := <-l.Items
-					if index.Typ == itemIndex {
-						indexedFields[name] = true
-					} else {
-						return x.Errorf("Invalid index specification")
-					}
-				}
-				return nil
-			}
-		case lex.ItemError:
-			return x.Errorf(item.Val)
-		}
-	}
-	return nil
-}
-
-func processObject(l *lex.Lexer) error {
-	var objName string
-	next := <-l.Items
-	if next.Typ != itemObject {
-		return x.Errorf("Missing object name")
-	}
-	objName = next.Val
-
-	obj := types.Object{
-		Name:   objName,
-		Fields: make(map[string]string),
-	}
-
-	next = <-l.Items
-	if next.Typ != itemLeftCurl {
-		return x.Errorf("Missing left curly brace")
-	}
-
-L:
-	for item := range l.Items {
-		switch item.Typ {
-		case itemRightCurl:
-			break L
-		case itemObjectName:
-			{
-				var name, typ string
-				name = item.Val
-
-				next := <-l.Items
-				if next.Typ != itemCollon {
-					return x.Errorf("Missing collon")
-				}
-
-				next = <-l.Items
-				if next.Typ != itemObjectType {
-					return x.Errorf("Missing Type")
-				}
-				typ = next.Val
-				if t, ok := getScalar(typ); ok {
-					if t1, ok := str[name]; ok {
-						if t1.(types.TypeID) != t.(types.TypeID) {
-							return x.Errorf("Same field cant have multiple types")
-						}
-					} else {
-						str[name] = t
-					}
-				}
-				if _, ok := obj.Fields[name]; ok {
-					return x.Errorf("Repeated field %v in object %v", name, objName)
-				}
-				obj.Fields[name] = typ
-			}
-		case lex.ItemError:
-			return x.Errorf(item.Val)
-		}
-	}
-	if len(obj.Fields) == 0 {
-		return x.Errorf("Object type %v with no fields", objName)
-	}
-	str[objName] = obj
-	return nil
+	return nil, x.Errorf("Shouldn't reach here")
 }
