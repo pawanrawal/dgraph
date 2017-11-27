@@ -1,46 +1,66 @@
 /*
- * Copyright 2016 DGraph Labs, Inc.
+ * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * 		http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-// Package worker contains code for internal worker communication to perform
+// Package worker contains code for intern.worker communication to perform
 // queries and mutations.
 package worker
 
 import (
-	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"sync"
-
-	"github.com/dgraph-io/dgraph/store"
+	"time"
 
 	"golang.org/x/net/context"
+
+	"github.com/dgraph-io/badger"
+	"github.com/dgraph-io/dgraph/conn"
+	"github.com/dgraph-io/dgraph/posting"
+	"github.com/dgraph-io/dgraph/protos/intern"
+	"github.com/dgraph-io/dgraph/x"
+
 	"google.golang.org/grpc"
 )
 
 var (
-	workerPort = flag.Int("workerport", 12345,
-		"Port used by worker for internal communication.")
-	backupPath = flag.String("backup", "backup",
-		"Folder in which to store backups.")
-	pstore *store.Store
+	pstore           *badger.ManagedDB
+	workerServer     *grpc.Server
+	raftServer       conn.RaftServer
+	pendingProposals chan struct{}
+	// In case of flaky network connectivity we would try to keep upto maxPendingEntries in wal
+	// so that the nodes which have lagged behind leader can just replay entries instead of
+	// fetching snapshot if network disconnectivity is greater than the interval at which snapshots
+	// are taken
 )
 
-func Init(ps *store.Store) {
+func workerPort() int {
+	return x.Config.PortOffset + x.PortInternal
+}
+
+func Init(ps *badger.ManagedDB) {
 	pstore = ps
+	// needs to be initialized after group config
+	pendingProposals = make(chan struct{}, Config.NumPendingProposals)
+	workerServer = grpc.NewServer(
+		grpc.MaxRecvMsgSize(x.GrpcMaxSize),
+		grpc.MaxSendMsgSize(x.GrpcMaxSize),
+		grpc.MaxConcurrentStreams(math.MaxInt32))
 }
 
 // grpcWorker struct implements the gRPC server interface.
@@ -63,28 +83,41 @@ func (w *grpcWorker) addIfNotPresent(reqid uint64) bool {
 	return true
 }
 
-// Hello rpc call is used to check connection with other workers after worker
-// tcp server for this instance starts.
-func (w *grpcWorker) Echo(ctx context.Context, in *Payload) (*Payload, error) {
-	return &Payload{Data: in.Data}, nil
-}
-
-// runServer initializes a tcp server on port which listens to requests from
-// other workers for internal communication.
-func RunServer() {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *workerPort))
+// RunServer initializes a tcp server on port which listens to requests from
+// other workers for intern.communication.
+func RunServer(bindall bool) {
+	laddr := "localhost"
+	if bindall {
+		laddr = "0.0.0.0"
+	}
+	var err error
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", laddr, workerPort()))
 	if err != nil {
 		log.Fatalf("While running server: %v", err)
 		return
 	}
-	log.Printf("Worker listening at address: %v", ln.Addr())
+	x.Printf("Worker listening at address: %v", ln.Addr())
 
-	s := grpc.NewServer()
-	RegisterWorkerServer(s, &grpcWorker{})
-	s.Serve(ln)
+	intern.RegisterWorkerServer(workerServer, &grpcWorker{})
+	intern.RegisterRaftServer(workerServer, &raftServer)
+	workerServer.Serve(ln)
 }
 
 // StoreStats returns stats for data store.
 func StoreStats() string {
-	return pstore.GetStats()
+	return "Currently no stats for badger"
+}
+
+// BlockingStop stops all the nodes, server between other workers and syncs all marks.
+func BlockingStop() {
+	// Sleep for 5 seconds to ensure that commit/abort is proposed.
+	time.Sleep(5 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	groups().Node.waitForTxnMarks(ctx)
+	groups().Node.Stop()        // blocking stop raft node.
+	workerServer.GracefulStop() // blocking stop server
+	groups().Node.applyAllMarks(ctx)
+	posting.StopLRUEviction()
+	groups().Node.snapshot(0)
 }

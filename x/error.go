@@ -1,11 +1,11 @@
 /*
- * Copyright 2016 Dgraph Labs, Inc.
+ * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * 		http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,11 +29,8 @@ package x
 // (3) You want to generate a new error with stack trace info. Use x.Errorf.
 
 import (
-	"bytes"
-	"context"
 	"fmt"
 	"log"
-	"strings"
 
 	"github.com/pkg/errors"
 )
@@ -57,39 +54,37 @@ func Check2(_ interface{}, err error) {
 	Check(err)
 }
 
-// Check2f acts as convenience wrapper around Checkf, using the 2nd argument as error.
-func Check2f(_ interface{}, err error, format string, args ...interface{}) {
-	Checkf(err, format, args)
-}
-
 // AssertTrue asserts that b is true. Otherwise, it would log fatal.
 func AssertTrue(b bool) {
 	if !b {
-		log.Fatalf("%+v", Errorf("Assert failed"))
+		log.Fatalf("%+v", errors.Errorf("Assert failed"))
 	}
 }
 
 // AssertTruef is AssertTrue with extra info.
 func AssertTruef(b bool, format string, args ...interface{}) {
 	if !b {
-		log.Fatalf("%+v", Errorf(format, args...))
+		log.Fatalf("%+v", errors.Errorf(format, args...))
+	}
+}
+
+func AssertTruefNoTrace(b bool, format string, args ...interface{}) {
+	if !b {
+		log.Fatalf("%+v", fmt.Errorf(format, args...))
 	}
 }
 
 // Wrap wraps errors from external lib.
 func Wrap(err error) error {
-	if !*debugMode {
-		return err
-	}
 	return errors.Wrap(err, "")
 }
 
 // Wrapf is Wrap with extra info.
 func Wrapf(err error, format string, args ...interface{}) error {
-	if !*debugMode {
-		if err == nil {
-			return nil
-		}
+	if err == nil {
+		return nil
+	}
+	if !Config.DebugMode {
 		return fmt.Errorf(format+" error: %+v", append(args, err)...)
 	}
 	return errors.Wrapf(err, format, args...)
@@ -97,7 +92,7 @@ func Wrapf(err error, format string, args ...interface{}) error {
 
 // Errorf creates a new error with stack trace, etc.
 func Errorf(format string, args ...interface{}) error {
-	if !*debugMode {
+	if !Config.DebugMode {
 		return fmt.Errorf(format, args...)
 	}
 	return errors.Errorf(format, args...)
@@ -106,85 +101,4 @@ func Errorf(format string, args ...interface{}) error {
 // Fatalf logs fatal.
 func Fatalf(format string, args ...interface{}) {
 	log.Fatalf("%+v", Errorf(format, args...))
-}
-
-const (
-	dgraphPrefix  = "github.com/dgraph-io/dgraph/"
-	runtimePrefix = "src/runtime/"
-	testingPrefix = "src/testing/"
-)
-
-func writeLineRef(buf *bytes.Buffer, s string) {
-	for _, p := range []string{dgraphPrefix, runtimePrefix, testingPrefix} {
-		idx := strings.Index(s, p)
-		if idx >= 0 {
-			buf.WriteString(s[idx+len(p):])
-			return
-		}
-	}
-	buf.WriteString(strings.TrimSpace(s))
-}
-
-func shortenedErrorString(err error) string {
-	buf := bytes.NewBuffer(make([]byte, 0, 40))
-
-	// Here is a sample input:
-	//	 some error
-	//	 github.com/dgraph-io/dgraph/x.Errorf
-	//		/home/jchiu/go/src/github.com/dgraph-io/dgraph/x/error.go:89
-	//	 main.f
-	//		/home/jchiu/go/src/github.com/dgraph-io/dgraph/x/tmp/main.go:10
-	//	 main.main
-	//		/home/jchiu/go/src/github.com/dgraph-io/dgraph/x/tmp/main.go:15
-	//	 runtime.main
-	//		/usr/lib/go-1.7/src/runtime/proc.go:183
-	//	 runtime.goexit
-	//		/usr/lib/go-1.7/src/runtime/asm_amd64.s:2086
-
-	// Here is a sample output:
-	// some error; x.Errorf (x/error.go:90) main.f (x/tmp/main.go:10) main.main (x/tmp/main.go:15) runtime.main (proc.go:183) runtime.goexit (asm_amd64.s:2086)
-
-	// First, split into lines.
-	lines := strings.Split(fmt.Sprintf("%+v\n", err), "\n")
-
-	// The tab prefix tells us whether this line is a line reference.
-	// We have two states. If lineRef is true, the last line we have seen is a line
-	// reference. The initial value is true.
-	lineRef := true
-
-	// Second, process each line, depending on whether it is a line ref or not.
-	for _, line := range lines {
-		if strings.HasPrefix(line, "\t") {
-			// This is a line reference. We want to shorten the filename and put it
-			// inside parentheses.
-			buf.WriteString(" (")
-			writeLineRef(buf, line)
-			buf.WriteString(") ")
-			lineRef = true
-		} else {
-			// This line is not a line reference.
-			if !lineRef {
-				// If the previous line is not a line reference either, we want to
-				// separate them by semicolons.
-				buf.WriteString("; ")
-			}
-			// Even though it is not a line reference, it might still contain "dgraph".
-			// Let's trim that away if possible.
-			buf.WriteString(strings.Replace(line, dgraphPrefix, "", -1))
-			lineRef = false
-		}
-	}
-	return buf.String()
-}
-
-// TraceError is like Trace but it logs just an error, which may have stacktrace.
-func TraceError(ctx context.Context, err error) {
-	if err == nil {
-		return
-	}
-	if !*debugMode {
-		Trace(ctx, err.Error())
-		return
-	}
-	Trace(ctx, shortenedErrorString(err))
 }

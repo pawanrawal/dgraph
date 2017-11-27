@@ -1,11 +1,11 @@
 /*
- * Copyright 2016 Dgraph Labs, Inc.
+ * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * 		http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -31,7 +31,7 @@ import (
 	"github.com/twpayne/go-geom/encoding/wkb"
 )
 
-func loadPolygon(name string) (*geom.Polygon, error) {
+func loadPolygon(name string) (geom.T, error) {
 	f, err := os.Open(name)
 	if err != nil {
 		return nil, err
@@ -47,10 +47,7 @@ func loadPolygon(name string) (*geom.Polygon, error) {
 	if err := gf.UnmarshalJSON(b.Bytes()); err != nil {
 		return nil, err
 	}
-	if p, ok := gf.Geometry.(*geom.Polygon); ok {
-		return p, nil
-	}
-	return nil, fmt.Errorf("Did not load a polygon from the json.")
+	return gf.Geometry, nil
 }
 
 func TestIndexCellsPoint(t *testing.T) {
@@ -117,15 +114,22 @@ func TestIndexCellsPolygon(t *testing.T) {
 	require.True(t, len(parents) > len(cover))
 }
 
+func TestIndexCellsPolygonError(t *testing.T) {
+	poly := geom.NewPolygon(geom.XY).MustSetCoords([][]geom.Coord{
+		{{-122, 37}, {-123, 37}, {-123, 38}, {-122, 38}, {-122, 38}}})
+	_, _, err := indexCells(poly)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Last coordinate not same as first")
+}
+
 func TestKeyGeneratorPoint(t *testing.T) {
 	p := geom.NewPoint(geom.XY).MustSetCoords(geom.Coord{-122.082506, 37.4249518})
 	data, err := wkb.Marshal(p, binary.LittleEndian)
 	require.NoError(t, err)
 
-	gc := ValueForType(GeoID)
 	src := ValueForType(BinaryID)
 	src.Value = data
-	err = Convert(src, &gc)
+	gc, err := Convert(src, GeoID)
 	require.NoError(t, err)
 	g := gc.Value.(geom.T)
 
@@ -140,16 +144,15 @@ func TestKeyGeneratorPolygon(t *testing.T) {
 	data, err := wkb.Marshal(p, binary.LittleEndian)
 	require.NoError(t, err)
 
-	gc := ValueForType(GeoID)
 	src := ValueForType(BinaryID)
 	src.Value = data
-	err = Convert(src, &gc)
+	gc, err := Convert(src, GeoID)
 	require.NoError(t, err)
 	g := gc.Value.(geom.T)
 
 	keys, err := IndexGeoTokens(g)
 	require.NoError(t, err)
-	require.Len(t, keys, 65)
+	require.Len(t, keys, 67)
 }
 
 func testCover(file string, max int) {
@@ -158,7 +161,7 @@ func testCover(file string, max int) {
 	if err != nil {
 		return
 	}
-	l, _ := loopFromPolygon(p)
+	l, _ := loopFromPolygon(p.(*geom.Polygon))
 	cu := coverLoop(l, MinCellLevel, MaxCellLevel, max)
 	printCells(cu)
 	printCoverAccuracy(l, cu)
@@ -166,7 +169,7 @@ func testCover(file string, max int) {
 
 func printCoverAccuracy(l *s2.Loop, cu s2.CellUnion) {
 	a1 := cellUnionArea(cu)
-	a2 := loopArea(l)
+	a2 := l.Area()
 	fmt.Printf("Loop area: %v. Cell area %v. Ratio %.3f\n", EarthArea(a2), EarthArea(a1), a1/a2)
 }
 
@@ -175,16 +178,6 @@ func cellUnionArea(cu s2.CellUnion) float64 {
 	for _, c := range cu {
 		cell := s2.CellFromCellID(c)
 		area += cell.ExactArea()
-	}
-	return area
-}
-
-func loopArea(l *s2.Loop) float64 {
-	n := l.NumEdges()
-	origin := l.Vertex(0)
-	var area float64
-	for i := 1; i < n-1; i++ {
-		area += s2.PointArea(origin, l.Vertex(i), l.Vertex(i+1)) * float64(s2.RobustSign(origin, l.Vertex(i), l.Vertex(i+1)))
 	}
 	return area
 }
@@ -236,10 +229,9 @@ func BenchmarkKeyGeneratorPoint(b *testing.B) {
 		b.Error(err)
 	}
 
-	gc := ValueForType(GeoID)
 	src := ValueForType(BinaryID)
 	src.Value = data
-	err = Convert(src, &gc)
+	gc, err := Convert(src, GeoID)
 	require.NoError(b, err)
 	g := gc.Value.(geom.T)
 
@@ -259,10 +251,9 @@ func BenchmarkKeyGeneratorPolygon(b *testing.B) {
 		b.Error(err)
 	}
 
-	gc := ValueForType(GeoID)
 	src := ValueForType(GeoID)
 	src.Value = data
-	err = Convert(src, &gc)
+	gc, err := Convert(src, GeoID)
 	require.NoError(b, err)
 	g := gc.Value.(geom.T)
 
@@ -277,7 +268,7 @@ func benchCover(b *testing.B, file string, max int) {
 	if err != nil {
 		b.Error(err)
 	}
-	l, _ := loopFromPolygon(p)
+	l, _ := loopFromPolygon(p.(*geom.Polygon))
 	var cu s2.CellUnion
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -293,6 +284,6 @@ func benchToLoop(b *testing.B, file string) {
 	}
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		_, _ = loopFromPolygon(p)
+		_, _ = loopFromPolygon(p.(*geom.Polygon))
 	}
 }

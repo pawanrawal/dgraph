@@ -1,23 +1,27 @@
 /*
- * Copyright 2016 Dgraph Labs, Inc.
+ * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * 		http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package query
 
 import (
-	"github.com/dgraph-io/dgraph/query/graph"
+	"encoding/base64"
+	"time"
+
+	"github.com/dgraph-io/dgraph/protos/api"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
 	geom "github.com/twpayne/go-geom"
@@ -26,26 +30,48 @@ import (
 // This file contains helper functions for converting scalar types to
 // protobuf values.
 
-func toProtoValue(v types.Val) *graph.Value {
-	switch val := v.Value.(type) {
-	case string:
-		return &graph.Value{&graph.Value_StrVal{string(val)}}
+func toProtoValue(v types.Val) *api.Value {
+	switch v.Tid {
+	case types.StringID:
+		return &api.Value{&api.Value_StrVal{v.Value.(string)}}
 
-	case int32:
-		return &graph.Value{&graph.Value_IntVal{int32(val)}}
+	case types.IntID:
+		return &api.Value{&api.Value_IntVal{v.Value.(int64)}}
 
-	case float64:
-		return &graph.Value{&graph.Value_DoubleVal{float64(val)}}
+	case types.FloatID:
+		return &api.Value{&api.Value_DoubleVal{v.Value.(float64)}}
 
-	case bool:
-		return &graph.Value{&graph.Value_BoolVal{bool(val)}}
+	case types.BoolID:
+		return &api.Value{&api.Value_BoolVal{v.Value.(bool)}}
 
-	case geom.T:
+	case types.DateTimeID:
+		val := v.Value.(time.Time)
+		return &api.Value{&api.Value_StrVal{val.Format(time.RFC3339)}}
+
+	case types.BinaryID:
+		val := v.Value.([]byte)
+		dst := make([]byte, base64.StdEncoding.DecodedLen(len(val)))
+		n, _ := base64.StdEncoding.Decode(dst, val)
+		if n < len(dst) {
+			dst = dst[:n]
+		}
+		return &api.Value{&api.Value_BytesVal{dst}}
+
+	case types.GeoID:
 		b := types.ValueForType(types.BinaryID)
 		src := types.ValueForType(types.GeoID)
-		src.Value = val
+		src.Value = v.Value.(geom.T)
 		x.Check(types.Marshal(src, &b))
-		return &graph.Value{&graph.Value_GeoVal{b.Value.([]byte)}}
+		return &api.Value{&api.Value_GeoVal{b.Value.([]byte)}}
+
+	case types.PasswordID:
+		return &api.Value{&api.Value_PasswordVal{v.Value.(string)}}
+
+	case types.UidID:
+		return &api.Value{&api.Value_UidVal{v.Value.(uint64)}}
+
+	case types.DefaultID:
+		return &api.Value{&api.Value_DefaultVal{v.Value.(string)}}
 
 	default:
 		// A type that isn't supported in the proto
