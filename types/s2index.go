@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016 Dgraph Labs, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * 		http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -30,8 +30,8 @@ func parentCoverTokens(parents s2.CellUnion, cover s2.CellUnion) []string {
 	// performant at query time to only look up parents/cover depending on what
 	// kind of query it is.
 	tokens := make([]string, 0, len(parents)+len(cover))
-	tokens = append(tokens, createTokens(parents, parentPrefix)...)
-	tokens = append(tokens, createTokens(cover, coverPrefix)...)
+	tokens = appendTokens(tokens, parents, parentPrefix)
+	tokens = appendTokens(tokens, cover, coverPrefix)
 	x.AssertTruef(len(tokens) == len(parents)+len(cover), "%d %d %d",
 		len(tokens), len(parents), len(cover))
 	return tokens
@@ -84,20 +84,6 @@ func indexCells(g geom.T) (parents, cover s2.CellUnion, err error) {
 		cover := coverLoop(l, MinCellLevel, MaxCellLevel, MaxCells)
 		parents := getParentCells(cover, MinCellLevel)
 		return parents, cover, nil
-	case *geom.MultiPolygon:
-		var cover s2.CellUnion
-		// Convert each polygon to loop. Get cover for each and append to cover.
-		for i := 0; i < v.NumPolygons(); i++ {
-			p := v.Polygon(i)
-			l, err := loopFromPolygon(p)
-			if err != nil {
-				return nil, nil, err
-			}
-			cover = append(cover, coverLoop(l, MinCellLevel, MaxCellLevel, MaxCells)...)
-		}
-		// Get parents for all cells in cover.
-		parents := getParentCells(cover, MinCellLevel)
-		return parents, cover, nil
 	default:
 		return nil, nil, x.Errorf("Cannot index geometry of type %T", v)
 	}
@@ -106,7 +92,7 @@ func indexCells(g geom.T) (parents, cover s2.CellUnion, err error) {
 const (
 	// MinCellLevel is the smallest cell level (largest cell size) used by indexing
 	MinCellLevel = 5 // Approx 250km x 380km
-	// MaxCellLevel is the largest cell level (smallest cell size) used by indexing
+	// MaxCellLevel is the largest cell leve (smallest cell size) used by indexing
 	MaxCellLevel = 16 // Approx 120m x 180m
 	// MaxCells is the maximum number of cells to use when indexing regions.
 	MaxCells = 18
@@ -133,9 +119,6 @@ func loopFromPolygon(p *geom.Polygon) (*s2.Loop, error) {
 	n := r.NumCoords()
 	if n < 4 {
 		return nil, x.Errorf("Can't convert ring with less than 4 pts")
-	}
-	if !r.Coord(0).Equal(geom.XY, r.Coord(n-1)) {
-		return nil, x.Errorf("Last coordinate not same as first for polygon: %+v\n", p)
 	}
 	// S2 specifies that the orientation of the polygons should be CCW. However there is no
 	// restriction on the orientation in WKB (or geojson). To get the correct orientation we assume
@@ -222,13 +205,18 @@ func coverLoop(l *s2.Loop, minLevel int, maxLevel int, maxCells int) s2.CellUnio
 		LevelMod: 0,
 		MaxCells: maxCells,
 	}
-	return rc.Covering(l)
+	return rc.Covering(loopRegion{l})
 }
 
 // appendTokens creates tokens with a certain prefix and append.
-func createTokens(cu s2.CellUnion, prefix string) (toks []string) {
+func appendTokens(toks []string, cu s2.CellUnion, prefix string) []string {
 	for _, c := range cu {
 		toks = append(toks, prefix+c.ToToken())
 	}
 	return toks
+}
+
+// toTokens creates tokens with a certain prefix.
+func toTokens(cu s2.CellUnion, prefix string) []string {
+	return appendTokens(nil, cu, prefix)
 }

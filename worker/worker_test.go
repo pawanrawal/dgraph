@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016 DGraph Labs, Inc.
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ * 		http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package worker
@@ -21,82 +20,74 @@ import (
 	"context"
 	"io/ioutil"
 	"os"
-	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/dgraph-io/badger"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dgraph-io/dgraph/algo"
 	"github.com/dgraph-io/dgraph/posting"
-	"github.com/dgraph-io/dgraph/protos/intern"
 	"github.com/dgraph-io/dgraph/schema"
+	"github.com/dgraph-io/dgraph/store"
+	"github.com/dgraph-io/dgraph/task"
 	"github.com/dgraph-io/dgraph/x"
 )
 
-var raftIndex uint64
-var ts uint64
-
-func timestamp() uint64 {
-	return atomic.AddUint64(&ts, 1)
+func addEdge(t *testing.T, edge *task.DirectedEdge, l *posting.List) {
+	edge.Op = task.DirectedEdge_SET
+	require.NoError(t,
+		l.AddMutationWithIndex(context.Background(), edge))
 }
 
-func addEdge(t *testing.T, edge *intern.DirectedEdge, l *posting.List) {
-	edge.Op = intern.DirectedEdge_SET
-	commitTransaction(t, edge, l)
-}
-
-func delEdge(t *testing.T, edge *intern.DirectedEdge, l *posting.List) {
-	edge.Op = intern.DirectedEdge_DEL
-	commitTransaction(t, edge, l)
+func delEdge(t *testing.T, edge *task.DirectedEdge, l *posting.List) {
+	edge.Op = task.DirectedEdge_DEL
+	require.NoError(t,
+		l.AddMutationWithIndex(context.Background(), edge))
 }
 
 func getOrCreate(key []byte) *posting.List {
-	l := posting.Get(key)
+	l, _ := posting.GetOrCreate(key, 0)
 	return l
 }
 
 func populateGraph(t *testing.T) {
-	// Add uid edges : predicate neightbour.
-	edge := &intern.DirectedEdge{
+	edge := &task.DirectedEdge{
 		ValueId: 23,
 		Label:   "author0",
-		Attr:    "neighbour",
+
+		Attr: "friend",
 	}
 	edge.Entity = 10
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 10)))
+	addEdge(t, edge, getOrCreate(x.DataKey("friend", 10)))
 
 	edge.Entity = 11
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 11)))
+	addEdge(t, edge, getOrCreate(x.DataKey("friend", 11)))
 
 	edge.Entity = 12
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 12)))
+	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
 
 	edge.ValueId = 25
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 12)))
+	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
 
 	edge.ValueId = 26
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 12)))
+	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
 
 	edge.Entity = 10
 	edge.ValueId = 31
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 10)))
+	addEdge(t, edge, getOrCreate(x.DataKey("friend", 10)))
 
 	edge.Entity = 12
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 12)))
+	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
 
-	// add value edges: friend : with name
-	edge.Attr = "friend"
 	edge.Entity = 12
 	edge.Value = []byte("photon")
-	edge.ValueId = 0
 	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
 
 	edge.Entity = 10
 	addEdge(t, edge, getOrCreate(x.DataKey("friend", 10)))
 }
 
-func taskValues(t *testing.T, v []*intern.TaskValue) []string {
+func taskValues(t *testing.T, v []*task.Value) []string {
 	out := make([]string, len(v))
 	for i, tv := range v {
 		out[i] = string(tv.Val)
@@ -104,67 +95,68 @@ func taskValues(t *testing.T, v []*intern.TaskValue) []string {
 	return out
 }
 
-func initTest(t *testing.T, schemaStr string) {
-	err := schema.ParseBytes([]byte(schemaStr), 1)
+func initTest(t *testing.T, schemaStr string) (string, *store.Store) {
+	schema.ParseBytes([]byte(schemaStr))
+
+	dir, err := ioutil.TempDir("", "storetest_")
 	require.NoError(t, err)
+
+	ps, err := store.NewStore(dir)
+	require.NoError(t, err)
+
+	posting.Init(ps)
 	populateGraph(t)
+	time.Sleep(200 * time.Millisecond) // Let the index process jobs from channel.
+
+	return dir, ps
 }
 
 func TestProcessTask(t *testing.T) {
-	initTest(t, `neighbour: uid .`)
+	dir, ps := initTest(t, `scalar friend:string @index`)
+	defer os.RemoveAll(dir)
+	defer ps.Close()
 
-	query := newQuery("neighbour", []uint64{10, 11, 12}, nil)
-	r, err := helpProcessTask(context.Background(), query, 1)
+	query := newQuery("friend", []uint64{10, 11, 12}, nil)
+	r, err := processTask(query, 0)
 	require.NoError(t, err)
 	require.EqualValues(t,
 		[][]uint64{
-			{23, 31},
-			{23},
-			{23, 25, 26, 31},
+			[]uint64{23, 31},
+			[]uint64{23},
+			[]uint64{23, 25, 26, 31},
 		}, algo.ToUintsListForTest(r.UidMatrix))
 }
 
 // newQuery creates a Query task and returns it.
-func newQuery(attr string, uids []uint64, srcFunc []string) *intern.Query {
+func newQuery(attr string, uids []uint64, srcFunc []string) *task.Query {
 	x.AssertTrue(uids == nil || srcFunc == nil)
-	// TODO: Change later, hacky way to make the tests work
-	var srcFun *intern.SrcFunction
-	if len(srcFunc) > 0 {
-		srcFun = new(intern.SrcFunction)
-		srcFun.Name = srcFunc[0]
-		srcFun.Args = append(srcFun.Args, srcFunc[2:]...)
-	}
-	q := &intern.Query{
-		UidList: &intern.List{uids},
-		SrcFunc: srcFun,
+	return &task.Query{
+		Uids:    uids,
+		SrcFunc: srcFunc,
 		Attr:    attr,
-		ReadTs:  timestamp(),
 	}
-	// It will have either nothing or attr, lang
-	if len(srcFunc) > 0 && srcFunc[1] != "" {
-		q.Langs = []string{srcFunc[1]}
-	}
-	return q
 }
 
 // Index-related test. Similar to TestProcessTaskIndex but we call MergeLists only
 // at the end. In other words, everything is happening only in mutation layers,
 // and not committed to RocksDB until near the end.
 func TestProcessTaskIndexMLayer(t *testing.T) {
-	initTest(t, `friend:string @index(term) .`)
+	dir, ps := initTest(t, `scalar friend:string @index`)
+	defer os.RemoveAll(dir)
+	defer ps.Close()
 
-	query := newQuery("friend", nil, []string{"anyofterms", "", "hey photon"})
-	r, err := helpProcessTask(context.Background(), query, 1)
+	query := newQuery("friend", nil, []string{"anyof", "hey photon"})
+	r, err := processTask(query, 0)
 	require.NoError(t, err)
 
 	require.EqualValues(t, [][]uint64{
-		{},
-		{10, 12},
+		[]uint64{},
+		[]uint64{10, 12},
 	}, algo.ToUintsListForTest(r.UidMatrix))
 
 	// Now try changing 12's friend value from "photon" to "notphotonExtra" to
 	// "notphoton".
-	edge := &intern.DirectedEdge{
+	edge := &task.DirectedEdge{
 		Value:  []byte("notphotonExtra"),
 		Label:  "author0",
 		Attr:   "friend",
@@ -173,21 +165,22 @@ func TestProcessTaskIndexMLayer(t *testing.T) {
 	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
 	edge.Value = []byte("notphoton")
 	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
+	time.Sleep(200 * time.Millisecond) // Let the index process jobs from channel.
 
 	// Issue a similar query.
-	query = newQuery("friend", nil, []string{"anyofterms", "", "hey photon notphoton notphotonExtra"})
-	r, err = helpProcessTask(context.Background(), query, 1)
+	query = newQuery("friend", nil, []string{"anyof", "hey photon notphoton notphotonExtra"})
+	r, err = processTask(query, 0)
 	require.NoError(t, err)
 
 	require.EqualValues(t, [][]uint64{
-		{},
-		{12},
-		{},
-		{10},
+		[]uint64{},
+		[]uint64{10},
+		[]uint64{12},
+		[]uint64{},
 	}, algo.ToUintsListForTest(r.UidMatrix))
 
 	// Try deleting.
-	edge = &intern.DirectedEdge{
+	edge = &task.DirectedEdge{
 		Value:  []byte("photon"),
 		Label:  "author0",
 		Attr:   "friend",
@@ -203,46 +196,56 @@ func TestProcessTaskIndexMLayer(t *testing.T) {
 	delEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
 	edge.Value = []byte("ignored")
 	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
+	time.Sleep(200 * time.Millisecond) // Let the index process jobs from channel.
 
 	// Issue a similar query.
-	query = newQuery("friend", nil, []string{"anyofterms", "", "photon notphoton ignored"})
-	r, err = helpProcessTask(context.Background(), query, 1)
+	query = newQuery("friend", nil, []string{"anyof", "photon notphoton ignored"})
+	r, err = processTask(query, 0)
 	require.NoError(t, err)
 
 	require.EqualValues(t, [][]uint64{
-		{12},
-		{},
-		{},
+		[]uint64{},
+		[]uint64{},
+		[]uint64{12},
 	}, algo.ToUintsListForTest(r.UidMatrix))
 
-	query = newQuery("friend", nil, []string{"anyofterms", "", "photon notphoton ignored"})
-	r, err = helpProcessTask(context.Background(), query, 1)
+	// Final touch: Merge everything to RocksDB.
+	posting.CommitLists(10)
+	time.Sleep(200 * time.Millisecond) // Let the index process jobs from channel.
+
+	query = newQuery("friend", nil, []string{"anyof", "photon notphoton ignored"})
+	r, err = processTask(query, 0)
 	require.NoError(t, err)
 
 	require.EqualValues(t, [][]uint64{
-		{12},
-		{},
-		{},
+		[]uint64{},
+		[]uint64{},
+		[]uint64{12},
 	}, algo.ToUintsListForTest(r.UidMatrix))
 }
 
 // Index-related test. Similar to TestProcessTaskIndeMLayer except we call
 // MergeLists in between a lot of updates.
 func TestProcessTaskIndex(t *testing.T) {
-	initTest(t, `friend:string @index(term) .`)
+	dir, ps := initTest(t, `scalar friend:string @index`)
+	defer os.RemoveAll(dir)
+	defer ps.Close()
 
-	query := newQuery("friend", nil, []string{"anyofterms", "", "hey photon"})
-	r, err := helpProcessTask(context.Background(), query, 1)
+	query := newQuery("friend", nil, []string{"anyof", "hey photon"})
+	r, err := processTask(query, 0)
 	require.NoError(t, err)
 
 	require.EqualValues(t, [][]uint64{
-		{},
-		{10, 12},
+		[]uint64{},
+		[]uint64{10, 12},
 	}, algo.ToUintsListForTest(r.UidMatrix))
+
+	posting.CommitLists(10)
+	time.Sleep(200 * time.Millisecond) // Let the index process jobs from channel.
 
 	// Now try changing 12's friend value from "photon" to "notphotonExtra" to
 	// "notphoton".
-	edge := &intern.DirectedEdge{
+	edge := &task.DirectedEdge{
 		Value:  []byte("notphotonExtra"),
 		Label:  "author0",
 		Attr:   "friend",
@@ -251,21 +254,25 @@ func TestProcessTaskIndex(t *testing.T) {
 	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
 	edge.Value = []byte("notphoton")
 	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
+	time.Sleep(200 * time.Millisecond) // Let the index process jobs from channel.
 
 	// Issue a similar query.
-	query = newQuery("friend", nil, []string{"anyofterms", "", "hey photon notphoton notphotonExtra"})
-	r, err = helpProcessTask(context.Background(), query, 1)
+	query = newQuery("friend", nil, []string{"anyof", "hey photon notphoton notphotonExtra"})
+	r, err = processTask(query, 0)
 	require.NoError(t, err)
 
 	require.EqualValues(t, [][]uint64{
-		{},
-		{12},
-		{},
-		{10},
+		[]uint64{},
+		[]uint64{10},
+		[]uint64{12},
+		[]uint64{},
 	}, algo.ToUintsListForTest(r.UidMatrix))
 
+	posting.CommitLists(10)
+	time.Sleep(200 * time.Millisecond) // Let the index process jobs from channel.
+
 	// Try deleting.
-	edge = &intern.DirectedEdge{
+	edge = &task.DirectedEdge{
 		Value:  []byte("photon"),
 		Label:  "author0",
 		Attr:   "friend",
@@ -281,22 +288,23 @@ func TestProcessTaskIndex(t *testing.T) {
 	delEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
 	edge.Value = []byte("ignored")
 	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
+	time.Sleep(200 * time.Millisecond) // Let indexing finish.
 
 	// Issue a similar query.
-	query = newQuery("friend", nil, []string{"anyofterms", "", "photon notphoton ignored"})
-	r, err = helpProcessTask(context.Background(), query, 1)
+	query = newQuery("friend", nil, []string{"anyof", "photon notphoton ignored"})
+	r, err = processTask(query, 0)
 	require.NoError(t, err)
 
 	require.EqualValues(t, [][]uint64{
-		{12},
-		{},
-		{},
+		[]uint64{},
+		[]uint64{},
+		[]uint64{12},
 	}, algo.ToUintsListForTest(r.UidMatrix))
 }
 
 /*
-func populateGraphForSort(t *testing.T, ps store.Store) {
-	edge := &intern.DirectedEdge{
+func populateGraphForSort(t *testing.T, ps *store.Store) {
+	edge := &task.DirectedEdge{
 		Label: "author1",
 		Attr:  "dob",
 	}
@@ -326,14 +334,14 @@ func populateGraphForSort(t *testing.T, ps store.Store) {
 	time.Sleep(200 * time.Millisecond) // Let indexing finish.
 }
 
-// newSort creates a intern.Sort for sorting.
-func newSort(uids [][]uint64, offset, count int) *intern.Sort {
+// newSort creates a task.Sort for sorting.
+func newSort(uids [][]uint64, offset, count int) *task.Sort {
 	x.AssertTrue(uids != nil)
-	uidMatrix := make([]*intern.List, len(uids))
+	uidMatrix := make([]*task.List, len(uids))
 	for i, l := range uids {
-		uidMatrix[i] = &intern.List{Uids: l}
+		uidMatrix[i] = &task.List{Uids: l}
 	}
-	return &intern.Sort{
+	return &task.Sort{
 		Attr:      "dob",
 		Offset:    int32(offset),
 		Count:     int32(count),
@@ -342,7 +350,7 @@ func newSort(uids [][]uint64, offset, count int) *intern.Sort {
 }
 
 func TestProcessSort(t *testing.T) {
-	dir, ps := initTest(t, `dob:date @index .`)
+	dir, ps := initTest(t, `scalar dob:date @index`)
 	defer os.RemoveAll(dir)
 	defer ps.Close()
 	populateGraphForSort(t, ps)
@@ -364,7 +372,7 @@ func TestProcessSort(t *testing.T) {
 }
 
 func TestProcessSortOffset(t *testing.T) {
-	dir, ps := initTest(t, `dob:date @index .`)
+	dir, ps := initTest(t, `scalar dob:date @index`)
 	defer os.RemoveAll(dir)
 	defer ps.Close()
 	populateGraphForSort(t, ps)
@@ -426,7 +434,7 @@ func TestProcessSortOffset(t *testing.T) {
 }
 
 func TestProcessSortCount(t *testing.T) {
-	dir, ps := initTest(t, `dob:date @index .`)
+	dir, ps := initTest(t, `scalar dob:date @index`)
 	defer os.RemoveAll(dir)
 	defer ps.Close()
 	populateGraphForSort(t, ps)
@@ -496,7 +504,7 @@ func TestProcessSortCount(t *testing.T) {
 }
 
 func TestProcessSortOffsetCount(t *testing.T) {
-	dir, ps := initTest(t, `dob:date @index .`)
+	dir, ps := initTest(t, `scalar dob:date @index`)
 	defer os.RemoveAll(dir)
 	defer ps.Close()
 	populateGraphForSort(t, ps)
@@ -594,33 +602,7 @@ func TestProcessSortOffsetCount(t *testing.T) {
 		algo.ToUintsListForTest(r.UidMatrix))
 }
 */
-
 func TestMain(m *testing.M) {
-	x.Init(true)
-	posting.Config.AllottedMemory = 1024.0
-	posting.Config.CommitFraction = 0.10
-	gr = new(groupi)
-	gr.gid = 1
-	gr.tablets = make(map[string]*intern.Tablet)
-	gr.tablets["name"] = &intern.Tablet{GroupId: 1}
-	gr.tablets["name2"] = &intern.Tablet{GroupId: 1}
-	gr.tablets["age"] = &intern.Tablet{GroupId: 1}
-	gr.tablets["friend"] = &intern.Tablet{GroupId: 1}
-	gr.tablets["http://www.w3.org/2000/01/rdf-schema#range"] = &intern.Tablet{GroupId: 1}
-	gr.tablets["friend_not_served"] = &intern.Tablet{GroupId: 2}
-	gr.tablets[""] = &intern.Tablet{GroupId: 1}
-
-	dir, err := ioutil.TempDir("", "storetest_")
-	x.Check(err)
-	defer os.RemoveAll(dir)
-
-	opt := badger.DefaultOptions
-	opt.Dir = dir
-	opt.ValueDir = dir
-	ps, err := badger.OpenManaged(opt)
-	x.Check(err)
-	pstore = ps
-	posting.Init(ps)
-	Init(ps)
+	x.Init()
 	os.Exit(m.Run())
 }

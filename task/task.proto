@@ -1,0 +1,121 @@
+// protoc --gofast_out=.  task.proto
+syntax = "proto3";
+
+package task;
+
+message List {
+	repeated fixed64 uids = 1;
+}
+
+message Value {
+	bytes val = 1;
+	int32 val_type = 2;
+}
+
+message Query {
+	string attr = 1;
+	int32 count = 2;       // Get this many elements.
+	int32 offset = 3;      // Skip this many elements.
+	fixed64 after_uid = 4;  // Only return UIDs greater than this.
+	bool do_count = 5;    // Are we just getting lengths?
+
+	// Exactly one of uids and terms is populated.
+	repeated fixed64 uids = 6;
+
+	// Function to generate or filter UIDs.
+	repeated string src_func = 7;
+}
+
+message Result {
+	repeated List uid_matrix = 1;
+	repeated Value values = 2;
+	repeated uint32 counts = 3;
+	bool intersect_dest = 4;
+}
+
+message Sort {
+	string attr = 1;
+	repeated List uid_matrix = 2;
+	int32 count = 3;   // Return this many elements.
+	int32 offset = 4;  // Skip this many elements.
+	bool desc = 5;
+}
+
+message SortResult {
+	repeated List uid_matrix = 1;
+}
+
+message Num {
+	uint32 group = 1;
+	int64 val = 2;
+	repeated uint64 uids = 3;
+}
+
+message RaftContext {
+	fixed64 id = 1;
+	uint32 group = 2;
+	string addr = 3;
+}
+
+// Membership stores information about RAFT group membership for a single RAFT node.
+// Note that each server can be serving multiple RAFT groups. Each group would have
+// one RAFT node per server serving that group.
+message Membership {
+	fixed64 id = 1;
+	uint32 group_id = 2;
+	string addr = 3;
+	bool leader = 4;
+	bool am_dead = 5;
+	uint64 last_update = 6;
+}
+
+// MembershipUpdate is used to pack together the current membership state of all the nodes
+// in the caller server; and the membership updates recorded by the callee server since
+// the provided lastUpdate.
+message MembershipUpdate {
+	repeated Membership members = 1;
+	uint64 last_update = 2;
+
+	bool redirect = 3;
+	string redirect_addr = 4;
+}
+
+message DirectedEdge {
+	fixed64 entity = 1;    // Subject or source node / UID.
+	string attr = 2;       // Attribute or predicate. Labels the edge.
+	bytes value = 3;       // Edge points to a value.
+	uint32 value_type = 4;  // The type of the value
+	fixed64 value_id = 5;   // Object or destination node / UID.
+	string label = 6;
+	enum Op {
+		SET = 0;
+		DEL = 1;
+	}
+	Op op = 7;
+}
+
+message Mutations {
+	uint32 group_id = 1;
+	repeated DirectedEdge edges = 2;
+}
+
+message Proposal {
+	uint32 id = 1;
+	Mutations mutations = 2;
+	Membership membership = 3;
+}
+
+message KV {
+	bytes key = 1;
+	bytes val = 2;
+}
+
+message KC {
+	bytes key = 1;
+	bytes checksum = 2;
+}
+
+message GroupKeys {
+	uint32 group_id = 1;
+	repeated KC keys = 2;
+}

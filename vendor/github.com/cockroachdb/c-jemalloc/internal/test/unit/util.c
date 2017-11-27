@@ -4,27 +4,27 @@
 	unsigned i, pow2;						\
 	t x;								\
 									\
-	assert_##suf##_eq(pow2_ceil_##suf(0), 0, "Unexpected result");	\
+	assert_zu_eq(pow2_ceil_##suf(0), 0, "Unexpected result");	\
 									\
 	for (i = 0; i < sizeof(t) * 8; i++) {				\
-		assert_##suf##_eq(pow2_ceil_##suf(((t)1) << i), ((t)1)	\
-		    << i, "Unexpected result");				\
+		assert_zu_eq(pow2_ceil_##suf(((t)1) << i), ((t)1) << i,	\
+		    "Unexpected result");				\
 	}								\
 									\
 	for (i = 2; i < sizeof(t) * 8; i++) {				\
-		assert_##suf##_eq(pow2_ceil_##suf((((t)1) << i) - 1),	\
+		assert_zu_eq(pow2_ceil_##suf((((t)1) << i) - 1),	\
 		    ((t)1) << i, "Unexpected result");			\
 	}								\
 									\
 	for (i = 0; i < sizeof(t) * 8 - 1; i++) {			\
-		assert_##suf##_eq(pow2_ceil_##suf((((t)1) << i) + 1),	\
+		assert_zu_eq(pow2_ceil_##suf((((t)1) << i) + 1),	\
 		    ((t)1) << (i+1), "Unexpected result");		\
 	}								\
 									\
 	for (pow2 = 1; pow2 < 25; pow2++) {				\
 		for (x = (((t)1) << (pow2-1)) + 1; x <= ((t)1) << pow2;	\
 		    x++) {						\
-			assert_##suf##_eq(pow2_ceil_##suf(x),		\
+			assert_zu_eq(pow2_ceil_##suf(x),		\
 			    ((t)1) << pow2,				\
 			    "Unexpected result, x=%"pri, x);		\
 		}							\
@@ -75,7 +75,6 @@ TEST_BEGIN(test_malloc_strtoumax)
 	};
 #define	ERR(e)		e, #e
 #define	KUMAX(x)	((uintmax_t)x##ULL)
-#define	KSMAX(x)	((uintmax_t)(intmax_t)x##LL)
 	struct test_s tests[] = {
 		{"0",		"0",	-1,	ERR(EINVAL),	UINTMAX_MAX},
 		{"0",		"0",	1,	ERR(EINVAL),	UINTMAX_MAX},
@@ -88,13 +87,13 @@ TEST_BEGIN(test_malloc_strtoumax)
 
 		{"42",		"",	0,	ERR(0),		KUMAX(42)},
 		{"+42",		"",	0,	ERR(0),		KUMAX(42)},
-		{"-42",		"",	0,	ERR(0),		KSMAX(-42)},
+		{"-42",		"",	0,	ERR(0),		KUMAX(-42)},
 		{"042",		"",	0,	ERR(0),		KUMAX(042)},
 		{"+042",	"",	0,	ERR(0),		KUMAX(042)},
-		{"-042",	"",	0,	ERR(0),		KSMAX(-042)},
+		{"-042",	"",	0,	ERR(0),		KUMAX(-042)},
 		{"0x42",	"",	0,	ERR(0),		KUMAX(0x42)},
 		{"+0x42",	"",	0,	ERR(0),		KUMAX(0x42)},
-		{"-0x42",	"",	0,	ERR(0),		KSMAX(-0x42)},
+		{"-0x42",	"",	0,	ERR(0),		KUMAX(-0x42)},
 
 		{"0",		"",	0,	ERR(0),		KUMAX(0)},
 		{"1",		"",	0,	ERR(0),		KUMAX(1)},
@@ -131,7 +130,6 @@ TEST_BEGIN(test_malloc_strtoumax)
 	};
 #undef ERR
 #undef KUMAX
-#undef KSMAX
 	unsigned i;
 
 	for (i = 0; i < sizeof(tests)/sizeof(struct test_s); i++) {
@@ -162,14 +160,14 @@ TEST_BEGIN(test_malloc_snprintf_truncated)
 {
 #define	BUFLEN	15
 	char buf[BUFLEN];
-	size_t result;
+	int result;
 	size_t len;
-#define	TEST(expected_str_untruncated, ...) do {			\
+#define TEST(expected_str_untruncated, ...) do {			\
 	result = malloc_snprintf(buf, len, __VA_ARGS__);		\
 	assert_d_eq(strncmp(buf, expected_str_untruncated, len-1), 0,	\
 	    "Unexpected string inequality (\"%s\" vs \"%s\")",		\
-	    buf, expected_str_untruncated);				\
-	assert_zu_eq(result, strlen(expected_str_untruncated),		\
+	    buf, expected_str_untruncated);		\
+	assert_d_eq(result, strlen(expected_str_untruncated),		\
 	    "Unexpected result");					\
 } while (0)
 
@@ -195,11 +193,11 @@ TEST_BEGIN(test_malloc_snprintf)
 {
 #define	BUFLEN	128
 	char buf[BUFLEN];
-	size_t result;
+	int result;
 #define	TEST(expected_str, ...) do {					\
 	result = malloc_snprintf(buf, sizeof(buf), __VA_ARGS__);	\
 	assert_str_eq(buf, expected_str, "Unexpected output");		\
-	assert_zu_eq(result, strlen(expected_str), "Unexpected result");\
+	assert_d_eq(result, strlen(expected_str), "Unexpected result");	\
 } while (0)
 
 	TEST("hello", "hello");

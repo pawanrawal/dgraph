@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2015 DGraph Labs, Inc.
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ * 		http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package gql
@@ -37,14 +36,10 @@ func TestNewLexer(t *testing.T) {
 			}
 		}
 	}`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexQuery)
-
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
+	l := &lex.Lexer{}
+	l.Init(input)
+	go run(l)
+	for item := range l.Items {
 		require.NotEqual(t, item.Typ, lex.ItemError)
 		t.Log(item.String())
 	}
@@ -67,65 +62,13 @@ func TestNewLexerMutation(t *testing.T) {
 			_city
 		}
 	}`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
-		require.NotEqual(t, item.Typ, lex.ItemError, "Error: %v", item.String())
-		t.Log(item.String())
-	}
-}
-
-func TestNewSchemaQuery(t *testing.T) {
-	input := `
-	schema {
-		pred
-		type
-	}
-	schema( pred : name ) {
-		pred
-		type
-	}
-	schema( pred : name,hi ) { #This is valid in lexer, parser would throw error
-		pred
-		type
-	}
-	schema( pred : [name,hi] ) {
-		pred
-		type
-	}`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
+	l := &lex.Lexer{}
+	l.Init(input)
+	go run(l)
+	for item := range l.Items {
 		require.NotEqual(t, item.Typ, lex.ItemError)
 		t.Log(item.String())
 	}
-}
-
-func TestAbruptSchemaQuery(t *testing.T) {
-	input := `
-	schema {
-		pred
-	`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
-	var typ lex.ItemType
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
-		t.Log(item.String())
-		typ = item.Typ
-	}
-	require.Equal(t, lex.ItemError, typ)
 }
 
 func TestAbruptMutation(t *testing.T) {
@@ -136,18 +79,15 @@ func TestAbruptMutation(t *testing.T) {
 			Why is this #!!?
 			How is this?
 	}`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
+	l := &lex.Lexer{}
+	l.Init(input)
+	go run(l)
 	var typ lex.ItemType
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
+	for item := range l.Items {
 		t.Log(item.String())
 		typ = item.Typ
 	}
-	require.Equal(t, lex.ItemError, typ)
+	require.Equal(t, typ, lex.ItemError)
 }
 
 func TestVariables1(t *testing.T) {
@@ -157,13 +97,10 @@ func TestVariables1(t *testing.T) {
 			_city
 		}
 	}`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
+	l := &lex.Lexer{}
+	l.Init(input)
+	go run(l)
+	for item := range l.Items {
 		require.NotEqual(t, item.Typ, lex.ItemError)
 		t.Log(item.String(), item.Typ)
 	}
@@ -176,13 +113,10 @@ func TestVariables2(t *testing.T) {
 			_city
 		}
 	}`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
+	l := &lex.Lexer{}
+	l.Init(input)
+	go run(l)
+	for item := range l.Items {
 		require.NotEqual(t, item.Typ, lex.ItemError)
 		t.Log(item.String(), item.Typ)
 	}
@@ -195,73 +129,29 @@ func TestVariablesDefault(t *testing.T) {
 			_city
 		}
 	}`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
+	l := &lex.Lexer{}
+	l.Init(input)
+	go run(l)
+	for item := range l.Items {
 		require.NotEqual(t, item.Typ, lex.ItemError)
-		t.Log(item.String())
+		t.Log(item.String(), item.Typ)
 	}
 }
 
-func TestIRIRef(t *testing.T) {
+func TestVariablesError(t *testing.T) {
 	input := `
-	query testQuery {
-		me(id : <http://helloworld.com/how/are/you>) {
-		        <http://verygood.com/what/about/you>
+	query testQuery($username: string {
+		me(_xid_: rick) {
+			_city
 		}
 	}`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
-		require.NotEqual(t, item.Typ, lex.ItemError)
+	l := &lex.Lexer{}
+	l.Init(input)
+	go run(l)
+	var typ lex.ItemType
+	for item := range l.Items {
 		t.Log(item.String())
+		typ = item.Typ
 	}
-}
-
-func TestLangSupport(t *testing.T) {
-	input := `
-	query {
-		me(id: test) {
-			name@en
-		}
-	}
-	`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
-		require.NotEqual(t, item.Typ, lex.ItemError)
-		t.Log(item.String())
-	}
-}
-
-func TestMultiLangSupport(t *testing.T) {
-	input := `
-	query {
-		me(id: test) {
-			name@en, name@en:ru:fr:de
-		}
-	}
-	`
-	l := lex.Lexer{
-		Input: input,
-	}
-	l.Run(lexTopLevel)
-	it := l.NewIterator()
-	for it.Next() {
-		item := it.Item()
-		require.NotEqual(t, item.Typ, lex.ItemError)
-		t.Log(item.String())
-	}
+	require.Equal(t, typ, lex.ItemError)
 }
