@@ -1,60 +1,55 @@
-/*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- */
-
 package worker
 
 import (
+	"flag"
 	"fmt"
-	"math"
-	"sync/atomic"
+	"math/rand"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/context"
 
-	"github.com/dgraph-io/badger"
-	"github.com/dgraph-io/dgraph/conn"
-	"github.com/dgraph-io/dgraph/posting"
-	"github.com/dgraph-io/dgraph/protos/api"
-	"github.com/dgraph-io/dgraph/protos/intern"
 	"github.com/dgraph-io/dgraph/raftwal"
-	"github.com/dgraph-io/dgraph/schema"
+	"github.com/dgraph-io/dgraph/store"
+	"github.com/dgraph-io/dgraph/task"
 	"github.com/dgraph-io/dgraph/x"
 )
 
+var (
+	groupIds = flag.String("groups", "0,1", "RAFT groups handled by this server.")
+	myAddr   = flag.String("my", "",
+		"addr:port of this server, so other Dgraph servers can talk to this.")
+	peer   = flag.String("peer", "", "Address of any peer.")
+	raftId = flag.Uint64("idx", 1, "RAFT ID that this server will use to join RAFT groups.")
+
+	emptyMembershipUpdate task.MembershipUpdate
+)
+
 type server struct {
-	NodeId    uint64     // Raft Id associated with the raft node.
-	Addr      string     // The public address of the server serving this node.
-	Leader    bool       // Set to true if the node is a leader of the group.
-	RaftIdx   uint64     // The raft index which applied this membership update in group zero.
-	PoolOrNil *conn.Pool // An owned reference to the server's Pool entry (nil if Addr is our own).
+	NodeId  uint64 // Raft Id associated with the raft node.
+	Addr    string // The public address of the server serving this node.
+	Leader  bool   // Set to true if the node is a leader of the group.
+	RaftIdx uint64 // The raft index which applied this membership update in group zero.
+}
+
+type servers struct {
+	list []server
 }
 
 type groupi struct {
-	x.SafeMutex
-	// TODO: Is this context being used?
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wal       *raftwal.Wal
-	state     *intern.MembershipState
-	Node      *node
-	gid       uint32
-	tablets   map[string]*intern.Tablet
-	triggerCh chan struct{} // Used to trigger membership sync
-	delPred   chan struct{} // Ensures that predicate move doesn't happen when deletion is ongoing.
+	sync.RWMutex
+	ctx    context.Context
+	cancel context.CancelFunc
+	wal    *raftwal.Wal
+	// local stores the groupId to node map for this server.
+	local map[uint32]*node
+	// all stores the groupId to servers map for the entire cluster.
+	all        map[uint32]*servers
+	num        uint32
+	lastUpdate uint64
 }
 
 var gr *groupi
@@ -67,609 +62,438 @@ func groups() *groupi {
 // and either start or restart RAFT nodes.
 // This function triggers RAFT nodes to be created, and is the entrace to the RAFT
 // world from main.go.
-func StartRaftNodes(walStore *badger.ManagedDB, bindall bool) {
+func StartRaftNodes(walDir string) {
 	gr = new(groupi)
 	gr.ctx, gr.cancel = context.WithCancel(context.Background())
 
-	if len(Config.MyAddr) == 0 {
-		Config.MyAddr = fmt.Sprintf("localhost:%d", workerPort())
-	} else {
-		// check if address is valid or not
-		ok := x.ValidateAddress(Config.MyAddr)
-		x.AssertTruef(ok, "%s is not valid address", Config.MyAddr)
-		if !bindall {
-			x.Printf("--my flag is provided without bindall, Did you forget to specify bindall?\n")
+	// Successfully connect with the peer, before doing anything else.
+	if len(*peer) > 0 {
+		_, paddr := parsePeer(*peer)
+		pools().connect(paddr)
+
+		// Force run syncMemberships with this peer, so our nodes know if they have other
+		// servers who are serving the same groups. That way, they can talk to them
+		// and try to join their clusters. Otherwise, they'll start off as a single-node
+		// cluster.
+		// IMPORTANT: Don't run any nodes until we have done at least one full sync for membership
+		// information with the cluster. If you start this node too quickly, just
+		// after starting the leader of group zero, that leader might not have updated
+		// itself in the memberships; and hence this node would think that no one is handling
+		// group zero. Therefore, we MUST wait to get pass a last update raft index of zero.
+		for gr.LastUpdate() == 0 {
+			time.Sleep(time.Second)
+			fmt.Println("Last update raft index for membership information is zero. Syncing...")
+			gr.syncMemberships()
 		}
+		fmt.Printf("Last update is now: %d\n", gr.LastUpdate())
 	}
 
-	x.AssertTruefNoTrace(len(Config.ZeroAddr) > 0, "Providing dgraphzero address is mandatory.")
-	x.AssertTruefNoTrace(Config.ZeroAddr != Config.MyAddr,
-		"Dgraph Zero address and Dgraph address (IP:Port) can't be the same.")
+	x.Checkf(os.MkdirAll(walDir, 0700), "Error while creating WAL dir.")
+	wals, err := store.NewSyncStore(walDir)
+	x.Checkf(err, "Error initializing wal store")
+	gr.wal = raftwal.Init(wals, *raftId)
 
-	if Config.RaftId == 0 {
-		id, err := raftwal.RaftId(walStore)
-		x.Check(err)
-		Config.RaftId = id
+	if len(*myAddr) == 0 {
+		*myAddr = fmt.Sprintf("localhost:%d", *workerPort)
 	}
-	x.Printf("Current Raft Id: %d\n", Config.RaftId)
 
-	// Successfully connect with dgraphzero, before doing anything else.
-	p := conn.Get().Connect(Config.ZeroAddr)
-
-	// Connect with dgraphzero and figure out what group we should belong to.
-	zc := intern.NewZeroClient(p.Get())
-	var connState *intern.ConnectionState
-	m := &intern.Member{Id: Config.RaftId, Addr: Config.MyAddr}
-	delay := 100 * time.Millisecond
-	for i := 0; i < 9; i++ { // Generous number of attempts.
-		var err error
-		connState, err = zc.Connect(gr.ctx, m)
-		if err == nil {
-			break
-		}
-		x.Printf("Error while connecting with group zero: %v", err)
-		time.Sleep(delay)
-		delay *= 2
+	for _, id := range strings.Split(*groupIds, ",") {
+		gid, err := strconv.ParseUint(id, 0, 32)
+		x.Checkf(err, "Unable to parse group id: %v", id)
+		node := groups().newNode(uint32(gid), *raftId, *myAddr)
+		go node.InitAndStartNode(gr.wal)
 	}
-	if connState.GetMember() == nil || connState.GetState() == nil {
-		x.Fatalf("Unable to join cluster via dgraphzero")
-	}
-	x.Printf("Connected to group zero. Connection state: %+v\n", connState)
-	Config.RaftId = connState.GetMember().GetId()
-	gr.applyState(connState.GetState())
-
-	gr.wal = raftwal.Init(walStore, Config.RaftId)
-	gr.triggerCh = make(chan struct{}, 1)
-	gr.delPred = make(chan struct{}, 1)
-	gid := gr.groupId()
-	gr.Node = newNode(gid, Config.RaftId, Config.MyAddr)
-	x.Checkf(schema.LoadFromDb(), "Error while initializing schema")
-	raftServer.Node = gr.Node.Node
-	gr.Node.InitAndStartNode(gr.wal)
-
-	x.UpdateHealthStatus(true)
-	go gr.periodicMembershipUpdate() // Now set it to be run periodically.
-	go gr.cleanupTablets()
-	go gr.processOracleDeltaStream()
-	go gr.periodicAbortOldTxns()
-	gr.proposeInitialSchema()
+	go gr.periodicSyncMemberships() // Now set it to be run periodically.
 }
 
-func (g *groupi) proposeInitialSchema() {
-	if !Config.ExpandEdge {
-		return
-	}
-	g.RLock()
-	_, ok := g.tablets[x.PredicateListAttr]
-	g.RUnlock()
-	if ok {
-		return
-	}
-
-	// Propose schema mutation.
-	var m intern.Mutations
-	// schema for _predicate_ is not changed once set.
-	m.StartTs = 1
-	m.Schema = append(m.Schema, &intern.SchemaUpdate{
-		Predicate: x.PredicateListAttr,
-		ValueType: intern.Posting_STRING,
-		List:      true,
-	})
-
-	// This would propose the schema mutation and make sure some node serves this predicate
-	// and has the schema defined above.
-	for {
-		_, err := MutateOverNetwork(gr.ctx, &m)
-		if err == nil {
-			break
-		}
-		fmt.Println("Error while proposing initial schema: ", err)
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// No locks are acquired while accessing this function.
-// Don't acquire RW lock during this, otherwise we might deadlock.
-func (g *groupi) groupId() uint32 {
-	return atomic.LoadUint32(&g.gid)
-}
-
-func (g *groupi) calculateTabletSizes() map[string]*intern.Tablet {
-	opt := badger.DefaultIteratorOptions
-	opt.PrefetchValues = false
-	txn := pstore.NewTransactionAt(math.MaxUint64, false)
-	defer txn.Discard()
-	itr := txn.NewIterator(opt)
-	defer itr.Close()
-
-	gid := g.groupId()
-	tablets := make(map[string]*intern.Tablet)
-
-	for itr.Rewind(); itr.Valid(); {
-		item := itr.Item()
-
-		pk := x.Parse(item.Key())
-		if pk == nil {
-			itr.Next()
-			continue
-		}
-		if pk.IsSchema() {
-			itr.Seek(pk.SkipSchema())
-			continue
-		}
-
-		tablet, has := tablets[pk.Attr]
-		if !has {
-			if !g.ServesTablet(pk.Attr) {
-				itr.Seek(pk.SkipPredicate())
-				continue
-			}
-			tablet = &intern.Tablet{GroupId: gid, Predicate: pk.Attr}
-			tablets[pk.Attr] = tablet
-		}
-		tablet.Space += item.EstimatedSize()
-		itr.Next()
-	}
-	return tablets
-}
-
-func MaxLeaseId() uint64 {
-	g := groups()
+func (g *groupi) Node(groupId uint32) *node {
 	g.RLock()
 	defer g.RUnlock()
-	return g.state.MaxLeaseId
-}
-
-func (g *groupi) applyState(state *intern.MembershipState) {
-	x.AssertTrue(state != nil)
-	g.Lock()
-	defer g.Unlock()
-	if g.state != nil && g.state.Counter >= state.Counter {
-		return
-	}
-
-	g.state = state
-	// Sometimes this can cause us to lose latest tablet info, but that shouldn't cause any issues.
-	g.tablets = make(map[string]*intern.Tablet)
-	for gid, group := range g.state.Groups {
-		for _, member := range group.Members {
-			if Config.RaftId == member.Id {
-				atomic.StoreUint32(&g.gid, gid)
-			}
-			if Config.MyAddr != member.Addr {
-				go conn.Get().Connect(member.Addr)
-			}
-		}
-		for _, tablet := range group.Tablets {
-			g.tablets[tablet.Predicate] = tablet
-		}
-	}
-	for _, member := range g.state.Zeros {
-		if Config.MyAddr != member.Addr {
-			go conn.Get().Connect(member.Addr)
-		}
-	}
-	for _, member := range g.state.Removed {
-		if member.GroupId == g.Node.gid && g.Node.AmLeader() {
-			g.Node.ProposePeerRemoval(context.Background(), member.Id)
-		}
-		// Each node should have different id and address.
-		conn.Get().Remove(member.Addr)
-	}
-}
-
-func (g *groupi) ServesGroup(gid uint32) bool {
-	g.RLock()
-	defer g.RUnlock()
-	return g.gid == gid
-}
-
-func (g *groupi) BelongsTo(key string) uint32 {
-	g.RLock()
-	tablet, ok := g.tablets[key]
-	g.RUnlock()
-
-	if ok {
-		return tablet.GroupId
-	}
-	tablet = g.Tablet(key)
-	if tablet != nil {
-		return tablet.GroupId
-	}
-	return 0
-}
-
-func (g *groupi) ServesTablet(key string) bool {
-	tablet := g.Tablet(key)
-	if tablet != nil && tablet.GroupId == groups().groupId() {
-		return true
-	}
-	return false
-}
-
-// Do not modify the returned Tablet
-func (g *groupi) Tablet(key string) *intern.Tablet {
-	// TODO: Remove all this later, create a membership state and apply it
-	g.RLock()
-	tablet, ok := g.tablets[key]
-	g.RUnlock()
-	if ok {
-		return tablet
-	}
-
-	x.Printf("Asking if I can serve tablet for: %v\n", key)
-	// We don't know about this tablet.
-	// Check with dgraphzero if we can serve it.
-	pl := g.AnyServer(0)
-	if pl == nil {
-		return nil
-	}
-	zc := intern.NewZeroClient(pl.Get())
-
-	tablet = &intern.Tablet{GroupId: g.groupId(), Predicate: key}
-	out, err := zc.ShouldServe(context.Background(), tablet)
-	if err != nil {
-		x.Printf("Error while ShouldServe grpc call %v", err)
-		return nil
-	}
-	g.Lock()
-	g.tablets[key] = out
-	g.Unlock()
-	return out
-}
-
-func (g *groupi) HasMeInState() bool {
-	g.RLock()
-	defer g.RUnlock()
-
-	group, has := g.state.Groups[g.groupId()]
-	if !has {
-		return false
-	}
-	_, has = group.Members[g.Node.Id]
-	return has
-}
-
-// Returns 0, 1, or 2 valid server addrs.
-func (g *groupi) AnyTwoServers(gid uint32) []string {
-	g.RLock()
-	defer g.RUnlock()
-	group, has := g.state.Groups[gid]
-	if !has {
-		return []string{}
-	}
-	var res []string
-	for _, m := range group.Members {
-		// map iteration gives us members in no particular order.
-		res = append(res, m.Addr)
-		if len(res) >= 2 {
-			break
-		}
-	}
-	return res
-}
-
-func (g *groupi) members(gid uint32) map[uint64]*intern.Member {
-	g.RLock()
-	defer g.RUnlock()
-
-	if gid == 0 {
-		return g.state.Zeros
-	}
-	group, has := g.state.Groups[gid]
-	if !has {
-		return nil
-	}
-	return group.Members
-}
-
-func (g *groupi) AnyServer(gid uint32) *conn.Pool {
-	members := g.members(gid)
-	if members != nil {
-		for _, m := range members {
-			pl, err := conn.Get().Get(m.Addr)
-			if err == nil {
-				return pl
-			}
-		}
+	if n, has := g.local[groupId]; has {
+		return n
 	}
 	return nil
 }
 
-func (g *groupi) MyPeer() (uint64, bool) {
-	members := g.members(g.groupId())
-	if members != nil {
-		for _, m := range members {
-			if m.Id != g.Node.Id {
-				return m.Id, true
-			}
-		}
-	}
-	return 0, false
+func (g *groupi) ServesGroup(groupId uint32) bool {
+	g.RLock()
+	defer g.RUnlock()
+	_, has := g.local[groupId]
+	return has
 }
 
-// Leader will try to return the leader of a given group, based on membership information.
-// There is currently no guarantee that the returned server is the leader of the group.
-func (g *groupi) Leader(gid uint32) *conn.Pool {
-	members := g.members(gid)
-	if members == nil {
-		return nil
+func (g *groupi) newNode(groupId uint32, nodeId uint64, publicAddr string) *node {
+	g.Lock()
+	defer g.Unlock()
+	if g.local == nil {
+		g.local = make(map[uint32]*node)
 	}
-	for _, m := range members {
-		if m.Leader {
-			if pl, err := conn.Get().Get(m.Addr); err == nil {
-				return pl
-			}
+
+	node := newNode(groupId, nodeId, publicAddr)
+	if _, has := g.local[groupId]; has {
+		x.AssertTruef(false, "Didn't expect a node in RAFT group mapping: %v", groupId)
+	}
+	g.local[groupId] = node
+	return node
+}
+
+func (g *groupi) Server(id uint64, groupId uint32) (rs server, found bool) {
+	g.RLock()
+	defer g.RUnlock()
+	if g.all == nil {
+		return server{}, false
+	}
+	sl := g.all[groupId]
+	if sl == nil {
+		return server{}, false
+	}
+	for _, s := range sl.list {
+		if s.NodeId == id {
+			return s, true
 		}
 	}
-	// Unable to find a healthy connection to leader. Get connection to any other server in the
-	// group.
-	return g.AnyServer(gid)
+	return server{}, false
+}
+
+func (g *groupi) AnyServer(group uint32) string {
+	g.RLock()
+	defer g.RUnlock()
+	all := g.all[group]
+	if all == nil {
+		return ""
+	}
+	sz := len(all.list)
+	idx := rand.Intn(sz)
+	return all.list[idx].Addr
+}
+
+func (g *groupi) HasPeer(group uint32) bool {
+	g.RLock()
+	defer g.RUnlock()
+	all := g.all[group]
+	if all == nil {
+		return false
+	}
+	return len(all.list) > 0
+}
+
+// Leader will try to retrun the leader of a given group, based on membership information.
+// There is currently no guarantee that the returned server is the leader of the group.
+func (g *groupi) Leader(group uint32) (uint64, string) {
+	g.RLock()
+	defer g.RUnlock()
+	all := g.all[group]
+	if all == nil {
+		return 0, ""
+	}
+	return all.list[0].NodeId, all.list[0].Addr
 }
 
 func (g *groupi) KnownGroups() (gids []uint32) {
 	g.RLock()
 	defer g.RUnlock()
-	for gid := range g.state.Groups {
+	for gid := range g.all {
 		gids = append(gids, gid)
 	}
 	return
 }
 
-func (g *groupi) triggerMembershipSync() {
-	// It's ok if we miss the trigger, periodic membership sync runs every minute.
-	select {
-	case g.triggerCh <- struct{}{}:
-	// It's ok to ignore it, since we would be sending update of a later state
-	default:
-	}
-}
-
-func (g *groupi) periodicMembershipUpdate() {
-	ticker := time.NewTicker(time.Minute * 5)
-	// Node might not be the leader when we are calculating size.
-	// We need to send immediately on start so no leader check inside calculatesize.
-	tablets := g.calculateTabletSizes()
-
-START:
-	pl := g.AnyServer(0)
-	// We should always have some connection to dgraphzero.
-	if pl == nil {
-		x.Printf("WARNING: We don't have address of any dgraphzero server.")
-		time.Sleep(time.Second)
-		goto START
-	}
-
-	c := intern.NewZeroClient(pl.Get())
-	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := c.Update(ctx)
-	if err != nil {
-		x.Printf("Error while calling update %v\n", err)
-		time.Sleep(time.Second)
-		goto START
-	}
-
-	go func() {
-		n := g.Node
-		for {
-			// Blocking, should return if sending on stream fails(Need to verify).
-			state, err := stream.Recv()
-			if err != nil || state == nil {
-				x.Printf("Unable to sync memberships. Error: %v", err)
-				// If zero server is lagging behind leader.
-				if ctx.Err() == nil {
-					cancel()
-				}
-				return
-			}
-			if n.AmLeader() {
-				proposal := &intern.Proposal{State: state}
-				go n.ProposeAndWait(context.Background(), proposal)
-			}
-		}
-	}()
-
-	g.triggerMembershipSync() // Ticker doesn't start immediately
-OUTER:
-	for {
-		select {
-		case <-g.triggerCh:
-			// On start of node if it becomes a leader, we would send tablets size for sure.
-			if err := g.sendMembership(tablets, stream); err != nil {
-				stream.CloseSend()
-				break OUTER
-			}
-		case <-ticker.C:
-			// dgraphzero just adds to the map so we needn't worry about race condition
-			// where a newly added tablet is not sent.
-			if g.Node.AmLeader() {
-				tablets = g.calculateTabletSizes()
-			}
-			// Let's send update even if not leader, zero will know that this node is still
-			// active.
-			if err := g.sendMembership(tablets, stream); err != nil {
-				x.Printf("Error while updating tablets size %v\n", err)
-				stream.CloseSend()
-				break OUTER
-			}
-		case <-ctx.Done():
-			stream.CloseSend()
-			break OUTER
-		}
-	}
-	goto START
-}
-
-func (g *groupi) waitForBackgroundDeletion() {
-	// Waits for background cleanup if any to finish.
-	// No new cleanup on any predicate would start until we finish moving
-	// the predicate because read only flag would be set by now. We start deletion
-	// only when no predicate is being moved.
-	g.delPred <- struct{}{}
-	<-g.delPred
-}
-
-func (g *groupi) hasReadOnlyTablets() bool {
+func (g *groupi) isDuplicate(gid uint32, nid uint64, addr string, leader bool) bool {
 	g.RLock()
 	defer g.RUnlock()
-	if g.state == nil {
+	return g.duplicate(gid, nid, addr, leader)
+}
+
+// duplicate requires at least a read mutex lock to be held by the caller.
+// duplicate will return true if we already have a server which matches the arguments
+// provided to the function exactly. This is used to avoid re-applying the same update.
+func (g *groupi) duplicate(gid uint32, nid uint64, addr string, leader bool) bool {
+	sl := g.all[gid]
+	if sl == nil {
 		return false
 	}
-	for _, group := range g.state.Groups {
-		for _, tab := range group.Tablets {
-			if tab.ReadOnly {
-				return true
-			}
+	for _, s := range sl.list {
+		if s.NodeId == nid && s.Addr == addr && s.Leader == leader {
+			return true
 		}
 	}
 	return false
 }
 
-func (g *groupi) cleanupTablets() {
-	ticker := time.NewTimer(time.Minute * 10)
-	select {
-	case <-ticker.C:
-		func() {
-			opt := badger.DefaultIteratorOptions
-			opt.PrefetchValues = false
-			txn := pstore.NewTransactionAt(math.MaxUint64, false)
-			defer txn.Discard()
-			itr := txn.NewIterator(opt)
-			defer itr.Close()
+func (g *groupi) LastUpdate() uint64 {
+	g.RLock()
+	defer g.RUnlock()
+	return g.lastUpdate
+}
 
-			for itr.Rewind(); itr.Valid(); {
-				item := itr.Item()
+func (g *groupi) TouchLastUpdate(u uint64) {
+	g.Lock()
+	defer g.Unlock()
+	if g.lastUpdate < u {
+		g.lastUpdate = u
+	}
+}
 
-				// TODO: Investiage out of bounds.
-				pk := x.Parse(item.Key())
-				if pk == nil {
-					itr.Next()
-					continue
-				}
-
-				// Delete at most one predicate at a time.
-				// Tablet is not being served by me and is not read only.
-				// Don't use servesTablet function because it can return false even if
-				// request made to group zero fails. We might end up deleting a predicate
-				// on failure of network request even though no one else is serving this
-				// tablet.
-				if tablet := g.Tablet(pk.Attr); tablet != nil && tablet.GroupId != g.groupId() {
-					if g.hasReadOnlyTablets() {
-						return
-					}
-					g.delPred <- struct{}{}
-					// Predicate moves are disabled during deletion, deletePredicate purges everything.
-					posting.DeletePredicate(context.Background(), pk.Attr)
-					<-g.delPred
-					return
-				}
-				if pk.IsSchema() {
-					itr.Seek(pk.SkipSchema())
-					continue
-				}
-				itr.Seek(pk.SkipPredicate())
+// syncMemberships needs to be called in an periodic loop.
+// How syncMemberships works:
+// - Each server iterates over all the nodes it's serving, present in local.
+// - If serving group zero, propose membership status updates directly via RAFT.
+// - Otherwise, generates a membership update, which includes status of all serving nodes.
+// - Check if it has address of a server from group zero. If so, use that.
+// - Otherwise, use the peer information passed down via flags.
+// - Send update via UpdateMembership call to the peer.
+// - If the peer doesn't serve group zero, it would return back a redirect with the right address.
+// - Otherwise, it would iterate over the memberships, check for duplicates, and apply updates.
+// - Once iteration is over without errors, it would return back all new updates.
+// - These updates are then applied to groups().all state via applyMembershipUpdate.
+func (g *groupi) syncMemberships() {
+	if g.ServesGroup(0) {
+		// This server serves group zero.
+		g.RLock()
+		defer g.RUnlock()
+		for _, n := range g.local {
+			rc := n.raftContext
+			if g.duplicate(rc.Group, rc.Id, rc.Addr, n.AmLeader()) {
+				continue
 			}
-		}()
-	}
-}
 
-func (g *groupi) sendMembership(tablets map[string]*intern.Tablet,
-	stream intern.Zero_UpdateClient) error {
-	leader := g.Node.AmLeader()
-	member := &intern.Member{
-		Id:         Config.RaftId,
-		GroupId:    g.groupId(),
-		Addr:       Config.MyAddr,
-		Leader:     leader,
-		LastUpdate: uint64(time.Now().Unix()),
-	}
-	group := &intern.Group{
-		Members: make(map[uint64]*intern.Member),
-	}
-	group.Members[member.Id] = member
-	if leader {
-		group.Tablets = tablets
-	}
-
-	return stream.Send(group)
-}
-
-func (g *groupi) proposeDelta(oracleDelta *intern.OracleDelta) {
-	for startTs, commitTs := range oracleDelta.Commits {
-		if posting.Txns().Get(startTs) == nil {
-			posting.Oracle().Done(startTs)
-			continue
+			go func(rc *task.RaftContext, amleader bool) {
+				mm := &task.Membership{
+					Leader:  amleader,
+					Id:      rc.Id,
+					GroupId: rc.Group,
+					Addr:    rc.Addr,
+				}
+				zero := g.Node(0)
+				x.AssertTruef(zero != nil, "Expected node 0")
+				if err := zero.ProposeAndWait(zero.ctx, &task.Proposal{Membership: mm}); err != nil {
+					x.TraceError(g.ctx, err)
+				}
+			}(rc, n.AmLeader())
 		}
-		tctx := &api.TxnContext{StartTs: startTs, CommitTs: commitTs}
-		go g.Node.ProposeAndWait(context.Background(), &intern.Proposal{TxnContext: tctx})
+		return
 	}
-	for _, startTs := range oracleDelta.Aborts {
-		if posting.Txns().Get(startTs) == nil {
-			posting.Oracle().Done(startTs)
-			continue
+
+	// This server doesn't serve group zero.
+	// Generate membership update of all local nodes.
+	var mu task.MembershipUpdate
+	{
+		g.RLock()
+		for _, n := range g.local {
+			rc := n.raftContext
+			mu.Members = append(mu.Members,
+				&task.Membership{
+					Leader:  n.AmLeader(),
+					Id:      rc.Id,
+					GroupId: rc.Group,
+					Addr:    rc.Addr,
+				})
 		}
-		tctx := &api.TxnContext{StartTs: startTs}
-		go g.Node.ProposeAndWait(context.Background(), &intern.Proposal{TxnContext: tctx})
-	}
-}
-
-func (g *groupi) processOracleDeltaStream() {
-START:
-	pl := g.Leader(0)
-	// We should always have some connection to dgraphzero.
-	if pl == nil {
-		x.Printf("WARNING: We don't have address of any dgraphzero server.")
-		time.Sleep(time.Second)
-		goto START
+		mu.LastUpdate = g.lastUpdate
+		g.RUnlock()
 	}
 
-	c := intern.NewZeroClient(pl.Get())
-	stream, err := c.Oracle(context.Background(), &api.Payload{})
+	// Send an update to peer.
+	var pl *pool
+	addr := g.AnyServer(0)
+
+UPDATEMEMBERSHIP:
+	if len(addr) > 0 {
+		pl = pools().get(addr)
+	} else {
+		pl = pools().any()
+	}
+	conn, err := pl.Get()
+	if err == errNoConnection {
+		fmt.Println("Unable to sync memberships. No valid connection")
+		return
+	}
+	x.Check(err)
+	defer pl.Put(conn)
+
+	c := NewWorkerClient(conn)
+	update, err := c.UpdateMembership(g.ctx, &mu)
 	if err != nil {
-		x.Printf("Error while calling Oracle %v\n", err)
-		time.Sleep(time.Second)
-		goto START
+		x.TraceError(g.ctx, err)
+		return
 	}
 
-	go func() {
-		// In the event where there in no leader for a group, commit/abort won't get proposed.
-		// So periodically check oracle and propose
-		// Ticker time should be long enough so that same startTs
-		// doesn't get proposed again and again.
-		ticker := time.NewTicker(time.Minute)
-		for {
-			<-ticker.C
-			if g.Node.AmLeader() {
-				g.proposeDelta(posting.Oracle().CurrentState())
-			}
-		}
-	}()
-
-	for {
-		oracleDelta, err := stream.Recv()
-		if err != nil || oracleDelta == nil {
-			x.Printf("Error in oracle delta stream. Error: %v", err)
-			break
-		}
-		posting.Oracle().ProcessOracleDelta(oracleDelta)
-		// Do Immediately so that index keys are written.
-		g.proposeDelta(oracleDelta)
-	}
-	goto START
-}
-
-func (g *groupi) periodicAbortOldTxns() {
-	ticker := time.NewTicker(time.Second * 10)
-	for {
-		<-ticker.C
-		pl := groups().Leader(0)
-		if pl == nil {
+	// Check if we got a redirect.
+	if update.Redirect {
+		addr = update.RedirectAddr
+		if len(addr) == 0 {
 			return
 		}
-		zc := intern.NewZeroClient(pl.Get())
-		// Aborts if not already committed.
-		startTimestamps := posting.Txns().TxnsSinceSnapshot()
-		req := &intern.TxnTimestamps{Ts: startTimestamps}
-		zc.TryAbort(context.Background(), req)
+		fmt.Printf("Got redirect for: %q\n", addr)
+		pools().connect(addr)
+		goto UPDATEMEMBERSHIP
 	}
+
+	var lu uint64
+	for _, mm := range update.Members {
+		g.applyMembershipUpdate(update.LastUpdate, mm)
+		if lu < update.LastUpdate {
+			lu = update.LastUpdate
+		}
+	}
+	g.TouchLastUpdate(lu)
+}
+
+func (g *groupi) periodicSyncMemberships() {
+	t := time.NewTicker(10 * time.Second)
+	for {
+		select {
+		case <-t.C:
+			g.syncMemberships()
+		case <-g.ctx.Done():
+			return
+		}
+	}
+}
+
+// raftIdx is the RAFT index corresponding to the application of this
+// membership update in group zero.
+func (g *groupi) applyMembershipUpdate(raftIdx uint64, mm *task.Membership) {
+	update := server{
+		NodeId:  mm.Id,
+		Addr:    mm.Addr,
+		Leader:  mm.Leader,
+		RaftIdx: raftIdx,
+	}
+	if update.Addr != *myAddr {
+		go pools().connect(update.Addr)
+	}
+
+	fmt.Println("----------------------------")
+	fmt.Printf("====== APPLYING MEMBERSHIP UPDATE: %+v\n", update)
+	fmt.Println("----------------------------")
+	g.Lock()
+	defer g.Unlock()
+
+	if g.all == nil {
+		g.all = make(map[uint32]*servers)
+	}
+
+	sl := g.all[mm.GroupId]
+	if sl == nil {
+		sl = new(servers)
+		g.all[mm.GroupId] = sl
+	}
+
+	for {
+		// Remove all instances of the provided node. There should only be one.
+		found := false
+		for i, s := range sl.list {
+			if s.NodeId == update.NodeId {
+				found = true
+				sl.list[i] = sl.list[len(sl.list)-1]
+				sl.list = sl.list[:len(sl.list)-1]
+			}
+		}
+		if !found {
+			break
+		}
+	}
+
+	// Append update to the list. If it's a leader, move it to index zero.
+	sl.list = append(sl.list, update)
+	last := len(sl.list) - 1
+	if update.Leader {
+		sl.list[0], sl.list[last] = sl.list[last], sl.list[0]
+	}
+
+	// Update all servers upwards of index zero as followers.
+	for i := 1; i < len(sl.list); i++ {
+		sl.list[i].Leader = false
+	}
+
+	// Print out the entire list.
+	for gid, sl := range g.all {
+		fmt.Printf("Group: %v. List: %+v\n", gid, sl.list)
+	}
+}
+
+// MembershipUpdateAfter generates the Flatbuffer response containing all the
+// membership updates after the provided raft index.
+func (g *groupi) MembershipUpdateAfter(ridx uint64) *task.MembershipUpdate {
+	g.RLock()
+	defer g.RUnlock()
+
+	maxIdx := ridx
+	out := new(task.MembershipUpdate)
+
+	for gid, peers := range g.all {
+		for _, s := range peers.list {
+			if s.RaftIdx <= ridx {
+				continue
+			}
+			if s.RaftIdx > maxIdx {
+				maxIdx = s.RaftIdx
+			}
+			out.Members = append(out.Members,
+				&task.Membership{
+					Leader:  s.Leader,
+					Id:      s.NodeId,
+					GroupId: gid,
+					Addr:    s.Addr,
+				})
+		}
+	}
+
+	out.LastUpdate = maxIdx
+	return out
+}
+
+// UpdateMembership is the RPC call for updating membership for servers
+// which don't serve group zero.
+func (w *grpcWorker) UpdateMembership(ctx context.Context,
+	update *task.MembershipUpdate) (*task.MembershipUpdate, error) {
+	if ctx.Err() != nil {
+		return &emptyMembershipUpdate, ctx.Err()
+	}
+	if !groups().ServesGroup(0) {
+		addr := groups().AnyServer(0)
+		// fmt.Printf("I don't serve group zero. But, here's who does: %v\n", addr)
+
+		return &task.MembershipUpdate{
+			Redirect:     true,
+			RedirectAddr: addr,
+		}, nil
+	}
+
+	che := make(chan error, len(update.Members))
+	for _, mm := range update.Members {
+		if groups().isDuplicate(mm.GroupId, mm.Id, mm.Addr, mm.Leader) {
+			che <- nil
+			continue
+		}
+
+		mmNew := &task.Membership{
+			Leader:  mm.Leader,
+			Id:      mm.Id,
+			GroupId: mm.GroupId,
+			Addr:    mm.Addr,
+		}
+
+		go func(mmNew *task.Membership) {
+			zero := groups().Node(0)
+			che <- zero.ProposeAndWait(zero.ctx, &task.Proposal{Membership: mmNew})
+		}(mmNew)
+	}
+
+	for _ = range update.Members {
+		select {
+		case <-ctx.Done():
+			return &emptyMembershipUpdate, ctx.Err()
+		case err := <-che:
+			if err != nil {
+				return &emptyMembershipUpdate, err
+			}
+		}
+	}
+
+	// Find all membership updates since the provided lastUpdate. LastUpdate is
+	// the last raft index that the caller has recorded an update for.
+	reply := groups().MembershipUpdateAfter(update.LastUpdate)
+	return reply, nil
 }

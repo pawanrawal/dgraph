@@ -1,4 +1,3 @@
 #!/bin/bash
 
 /bin/bash $GOPATH/src/github.com/dgraph-io/dgraph/test
-

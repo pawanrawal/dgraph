@@ -1,590 +1,143 @@
 /*
- * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
+ * Copyright 2016 DGraph Labs, Inc.
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ * 		http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package worker
 
 import (
-	"bytes"
-	"errors"
-	"math"
-	"math/rand"
-	"time"
-
 	"golang.org/x/net/context"
-	"golang.org/x/net/trace"
 
-	"github.com/dgraph-io/badger"
-	"github.com/dgraph-io/dgraph/conn"
+	"github.com/dgraph-io/dgraph/group"
 	"github.com/dgraph-io/dgraph/posting"
-	"github.com/dgraph-io/dgraph/protos/api"
-	"github.com/dgraph-io/dgraph/protos/intern"
-	"github.com/dgraph-io/dgraph/schema"
-	"github.com/dgraph-io/dgraph/types"
+	"github.com/dgraph-io/dgraph/task"
 	"github.com/dgraph-io/dgraph/x"
-	"github.com/dgraph-io/dgraph/y"
 )
 
-var (
-	errUnservedTablet  = x.Errorf("Tablet isn't being served by this instance.")
-	errPredicateMoving = x.Errorf("Predicate is being moved, please retry later")
+const (
+	set = "set"
+	del = "delete"
 )
 
-func deletePredicateEdge(edge *intern.DirectedEdge) bool {
-	return edge.Entity == 0 && bytes.Equal(edge.Value, []byte(x.Star))
-}
-
-// runMutation goes through all the edges and applies them. It returns the
+// runMutations goes through all the edges and applies them. It returns the
 // mutations which were not applied in left.
-func runMutation(ctx context.Context, edge *intern.DirectedEdge, txn *posting.Txn) error {
-	if tr, ok := trace.FromContext(ctx); ok {
-		tr.LazyPrintf("In run mutations")
-	}
-	x.AssertTrue(groups().ServesTablet(edge.Attr))
-
-	typ, err := schema.State().TypeOf(edge.Attr)
-	x.Checkf(err, "Schema is not present for predicate %s", edge.Attr)
-
-	if deletePredicateEdge(edge) {
-		return errors.New("We should never reach here")
-	}
-	// Once mutation comes via raft we do best effort conversion
-	// Type check is done before proposing mutation, in case schema is not
-	// present, some invalid entries might be written initially
-	err = ValidateAndConvert(edge, typ)
-
-	key := x.DataKey(edge.Attr, edge.Entity)
-
-	t := time.Now()
-	plist := posting.Get(key)
-	if dur := time.Since(t); dur > time.Millisecond {
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf("GetLru took %v", dur)
-		}
-	}
-
-	if err = plist.AddMutationWithIndex(ctx, edge, txn); err != nil {
-		return err // abort applying the rest of them.
-	}
-	return nil
-}
-
-// This is serialized with mutations, called after applied watermarks catch up
-// and further mutations are blocked until this is done.
-func runSchemaMutation(ctx context.Context, update *intern.SchemaUpdate, startTs uint64) error {
-	if err := runSchemaMutationHelper(ctx, update, startTs); err != nil {
-		return err
-	}
-
-	// Flush to disk
-	posting.CommitLists(func(key []byte) bool {
-		pk := x.Parse(key)
-		if pk.Attr == update.Predicate {
-			return true
-		}
-		return false
-	})
-	// Write schema to disk.
-	rv := ctx.Value("raft").(x.RaftValue)
-	updateSchema(update.Predicate, *update, rv.Index)
-	return nil
-}
-
-func runSchemaMutationHelper(ctx context.Context, update *intern.SchemaUpdate, startTs uint64) error {
-	n := groups().Node
-	if !groups().ServesTablet(update.Predicate) {
-		return errUnservedTablet
-	}
-	if err := checkSchema(update); err != nil {
-		return err
-	}
-	old, ok := schema.State().Get(update.Predicate)
-	current := *update
-	// Sets only in memory, we will update it on disk only after schema mutations is successful and persisted
-	// to disk.
-	schema.State().Set(update.Predicate, current)
-
-	// Once we remove index or reverse edges from schema, even though the values
-	// are present in db, they won't be used due to validation in work/task.go
-
-	// We don't want to use sync watermarks for background removal, because it would block
-	// linearizable read requests. Only downside would be on system crash, stale edges
-	// might remain, which is ok.
-
-	// Indexing can't be done in background as it can cause race conditons with new
-	// index mutations (old set and new del)
-	// We need watermark for index/reverse edge addition for linearizable reads.
-	// (both applied and synced watermarks).
-	defer x.Printf("Done schema update %+v\n", update)
-	if !ok {
-		if current.Directive == intern.SchemaUpdate_INDEX {
-			if err := n.rebuildOrDelIndex(ctx, update.Predicate, true, startTs); err != nil {
-				return err
-			}
-		} else if current.Directive == intern.SchemaUpdate_REVERSE {
-			if err := n.rebuildOrDelRevEdge(ctx, update.Predicate, true, startTs); err != nil {
-				return err
-			}
+func runMutations(ctx context.Context, edges []*task.DirectedEdge) error {
+	for _, edge := range edges {
+		if !groups().ServesGroup(group.BelongsTo(edge.Attr)) {
+			return x.Errorf("Predicate fingerprint doesn't match this instance")
 		}
 
-		if current.Count {
-			if err := n.rebuildOrDelCountIndex(ctx, update.Predicate, true, startTs); err != nil {
-				return err
-			}
+		var group uint32
+		if rv, ok := ctx.Value("raft").(x.RaftValue); ok {
+			group = rv.Group
 		}
-		return nil
-	}
-	// schema was present already
-	if needReindexing(old, current) {
-		// Reindex if update.Index is true or remove index
-		if err := n.rebuildOrDelIndex(ctx, update.Predicate,
-			current.Directive == intern.SchemaUpdate_INDEX, startTs); err != nil {
-			return err
-		}
-	} else if needsRebuildingReverses(old, current) {
-		// Add or remove reverse edge based on update.Reverse
-		if err := n.rebuildOrDelRevEdge(ctx, update.Predicate,
-			current.Directive == intern.SchemaUpdate_REVERSE, startTs); err != nil {
-			return err
-		}
-	}
 
-	if current.Count != old.Count {
-		if err := n.rebuildOrDelCountIndex(ctx, update.Predicate, current.Count, startTs); err != nil {
+		key := x.DataKey(edge.Attr, edge.Entity)
+		plist, decr := posting.GetOrCreate(key, group)
+		defer decr()
+
+		if err := plist.AddMutationWithIndex(ctx, edge); err != nil {
+			x.Printf("Error while adding mutation: %v %v", edge, err)
+			return err // abort applying the rest of them.
 		}
 	}
 	return nil
 }
 
-func needsRebuildingReverses(old intern.SchemaUpdate, current intern.SchemaUpdate) bool {
-	return (current.Directive == intern.SchemaUpdate_REVERSE) !=
-		(old.Directive == intern.SchemaUpdate_REVERSE)
-}
-
-func needReindexing(old intern.SchemaUpdate, current intern.SchemaUpdate) bool {
-	if (current.Directive == intern.SchemaUpdate_INDEX) != (old.Directive == intern.SchemaUpdate_INDEX) {
-		return true
-	}
-	// if value types has changed
-	if current.Directive == intern.SchemaUpdate_INDEX && current.ValueType != old.ValueType {
-		return true
-	}
-	// if tokenizer has changed - if same tokenizer works differently
-	// on different types
-	if len(current.Tokenizer) != len(old.Tokenizer) {
-		return true
-	}
-	for i, t := range old.Tokenizer {
-		if current.Tokenizer[i] != t {
-			return true
-		}
-	}
-
-	return false
-}
-
-// We commit schema to disk in blocking way, should be ok because this happens
-// only during schema mutations or we see a new predicate.
-func updateSchema(attr string, s intern.SchemaUpdate, index uint64) error {
-	schema.State().Set(attr, s)
-	txn := pstore.NewTransactionAt(1, true)
-	defer txn.Discard()
-	data, err := s.Marshal()
-	x.Check(err)
-	if err := txn.Set(x.SchemaKey(attr), data); err != nil {
-		return err
-	}
-	return txn.CommitAt(1, nil)
-}
-
-func updateSchemaType(attr string, typ types.TypeID, index uint64) {
-	// Don't overwrite schema blindly, acl's might have been set even though
-	// type is not present
-	s, ok := schema.State().Get(attr)
-	if ok {
-		s.ValueType = typ.Enum()
-	} else {
-		s = intern.SchemaUpdate{ValueType: typ.Enum()}
-	}
-	updateSchema(attr, s, index)
-}
-
-func hasEdges(attr string, startTs uint64) bool {
-	iterOpt := badger.DefaultIteratorOptions
-	iterOpt.PrefetchValues = false
-	txn := pstore.NewTransactionAt(startTs, false)
-	defer txn.Discard()
-	it := txn.NewIterator(iterOpt)
-	defer it.Close()
-	pk := x.ParsedKey{
-		Attr: attr,
-	}
-	prefix := pk.DataPrefix()
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		return true
-	}
-	return false
-}
-
-func checkSchema(s *intern.SchemaUpdate) error {
-	if len(s.Predicate) == 0 {
-		return x.Errorf("No predicate specified in schema mutation")
-	}
-
-	if s.Directive == intern.SchemaUpdate_INDEX && len(s.Tokenizer) == 0 {
-		return x.Errorf("Tokenizer must be specified while indexing a predicate: %+v", s)
-	}
-
-	if len(s.Tokenizer) > 0 && s.Directive != intern.SchemaUpdate_INDEX {
-		return x.Errorf("Directive must be SchemaUpdate_INDEX when a tokenizer is specified")
-	}
-
-	typ := types.TypeID(s.ValueType)
-	if typ == types.UidID && s.Directive == intern.SchemaUpdate_INDEX {
-		// index on uid type
-		return x.Errorf("Index not allowed on predicate of type uid on predicate %s",
-			s.Predicate)
-	} else if typ != types.UidID && s.Directive == intern.SchemaUpdate_REVERSE {
-		// reverse on non-uid type
-		return x.Errorf("Cannot reverse for non-uid type on predicate %s", s.Predicate)
-	}
-	if t, err := schema.State().TypeOf(s.Predicate); err == nil {
-		// schema was defined already
-		if t.IsScalar() == typ.IsScalar() {
-			// If old type was list and new type is non-list, we don't allow it until user
-			// has data.
-			if schema.State().IsList(s.Predicate) && !s.List && hasEdges(s.Predicate, math.MaxUint64) {
-				return x.Errorf("Schema change not allowed from [%s] => %s without"+
-					" deleting pred: %s", t.Name(), typ.Name(), s.Predicate)
-			}
-			// New and old type are both scalar or both are uid. Allow schema change.
-			return nil
-		}
-		// uid => scalar or scalar => uid. Check that there shouldn't be any data.
-		if hasEdges(s.Predicate, math.MaxUint64) {
-			return x.Errorf("Schema change not allowed from predicate to uid or vice versa"+
-				" till you have data for pred: %s", s.Predicate)
-		}
-	}
-	return nil
-}
-
-// If storage type is specified, then check compatibility or convert to schema type
-// if no storage type is specified then convert to schema type.
-func ValidateAndConvert(edge *intern.DirectedEdge, schemaType types.TypeID) error {
-	if deletePredicateEdge(edge) {
-		return nil
-	}
-	if types.TypeID(edge.ValueType) == types.DefaultID && string(edge.Value) == x.Star {
-		if edge.Op != intern.DirectedEdge_DEL {
-			return x.Errorf("* allowed only with delete operation")
-		}
-		return nil
-	}
-	// <s> <p> <o> Del on non list scalar type.
-	if len(edge.Value) > 0 && !bytes.Equal(edge.Value, []byte(x.Star)) &&
-		edge.Op == intern.DirectedEdge_DEL {
-		if !schema.State().IsList(edge.Attr) {
-			return x.Errorf("Please use * with delete operation for non-list type")
-		}
-	}
-
-	storageType := posting.TypeID(edge)
-	if !schemaType.IsScalar() && !storageType.IsScalar() {
-		return nil
-	} else if !schemaType.IsScalar() && storageType.IsScalar() {
-		return x.Errorf("Input for predicate %s of type uid is scalar", edge.Attr)
-	} else if schemaType.IsScalar() && !storageType.IsScalar() {
-		return x.Errorf("Input for predicate %s of type scalar is uid", edge.Attr)
-	} else {
-		// Both are scalars. Continue.
-	}
-
-	if storageType == schemaType {
-		return nil
-	}
-
-	var src types.Val
-	var dst types.Val
-	var err error
-
-	src = types.Val{types.TypeID(edge.ValueType), edge.Value}
-	// check compatibility of schema type and storage type
-	if dst, err = types.Convert(src, schemaType); err != nil {
-		return err
-	}
-
-	// if storage type was specified skip
-	if storageType != types.DefaultID {
-		return nil
-	}
-
-	// convert to schema type
-	b := types.ValueForType(types.BinaryID)
-	if err = types.Marshal(dst, &b); err != nil {
-		return err
-	}
-	edge.ValueType = schemaType.Enum()
-	edge.Value = b.Value.([]byte)
-	return nil
-}
-
-func AssignUidsOverNetwork(ctx context.Context, num *intern.Num) (*api.AssignedIds, error) {
-	pl := groups().Leader(0)
-	if pl == nil {
-		return nil, conn.ErrNoConnection
-	}
-
-	conn := pl.Get()
-	c := intern.NewZeroClient(conn)
-	return c.AssignUids(ctx, num)
-}
-
-func Timestamps(ctx context.Context, num *intern.Num) (*api.AssignedIds, error) {
-	pl := groups().Leader(0)
-	if pl == nil {
-		return nil, conn.ErrNoConnection
-	}
-
-	conn := pl.Get()
-	c := intern.NewZeroClient(conn)
-	return c.Timestamps(ctx, num)
-}
-
-// proposeOrSend either proposes the mutation if the node serves the group gid or sends it to
-// the leader of the group gid for proposing.
-func proposeOrSend(ctx context.Context, gid uint32, m *intern.Mutations, chr chan res) {
-	res := res{}
+// runMutate is used to run the mutations on an instance.
+func proposeOrSend(ctx context.Context, gid uint32, m *task.Mutations, che chan error) {
 	if groups().ServesGroup(gid) {
-		node := groups().Node
-		// we don't timeout after proposing
-		res.err = node.ProposeAndWait(ctx, &intern.Proposal{Mutations: m})
-		res.ctx = &api.TxnContext{}
-		if txn := posting.Txns().Get(m.StartTs); txn != nil {
-			txn.Fill(res.ctx)
-		}
-		res.ctx.LinRead = &api.LinRead{
-			Ids: make(map[uint32]uint64),
-		}
-		res.ctx.LinRead.Ids[gid] = node.Applied.DoneUntil()
-		chr <- res
+		node := groups().Node(gid)
+		che <- node.ProposeAndWait(ctx, &task.Proposal{Mutations: m})
 		return
 	}
 
-	pl := groups().Leader(gid)
-	if pl == nil {
-		res.err = conn.ErrNoConnection
-		if tr, ok := trace.FromContext(ctx); ok {
-			tr.LazyPrintf(res.err.Error())
-		}
-		chr <- res
+	_, addr := groups().Leader(gid)
+	pl := pools().get(addr)
+	conn, err := pl.Get()
+	if err != nil {
+		x.TraceError(ctx, err)
+		che <- err
 		return
 	}
-	conn := pl.Get()
+	defer pl.Put(conn)
 
-	var tc *api.TxnContext
-	c := intern.NewWorkerClient(conn)
-
-	ch := make(chan error, 1)
-	go func() {
-		var err error
-		tc, err = c.Mutate(ctx, m)
-		ch <- err
-	}()
-
-	select {
-	case <-ctx.Done():
-		res.err = ctx.Err()
-		res.ctx = nil
-	case err := <-ch:
-		res.err = err
-		res.ctx = tc
-	}
-	chr <- res
+	c := NewWorkerClient(conn)
+	_, err = c.Mutate(ctx, m)
+	che <- err
 }
 
-// populateMutationMap populates a map from group id to the mutation that
-// should be sent to that group.
-func populateMutationMap(src *intern.Mutations) map[uint32]*intern.Mutations {
-	mm := make(map[uint32]*intern.Mutations)
-	for _, edge := range src.Edges {
-		gid := groups().BelongsTo(edge.Attr)
-		mu := mm[gid]
+// addToMutationArray adds the edges to the appropriate index in the mutationArray,
+// taking into account the op(operation) and the attribute.
+func addToMutationMap(mutationMap map[uint32]*task.Mutations, edges []*task.DirectedEdge) {
+	for _, edge := range edges {
+		gid := group.BelongsTo(edge.Attr)
+		mu := mutationMap[gid]
 		if mu == nil {
-			mu = &intern.Mutations{GroupId: gid}
-			mm[gid] = mu
+			mu = &task.Mutations{GroupId: gid}
+			mutationMap[gid] = mu
 		}
 		mu.Edges = append(mu.Edges, edge)
 	}
-	for _, schema := range src.Schema {
-		gid := groups().BelongsTo(schema.Predicate)
-		mu := mm[gid]
-		if mu == nil {
-			mu = &intern.Mutations{GroupId: gid}
-			mm[gid] = mu
-		}
-		mu.Schema = append(mu.Schema, schema)
-	}
-	if src.DropAll {
-		for _, gid := range groups().KnownGroups() {
-			mu := mm[gid]
-			if mu == nil {
-				mu = &intern.Mutations{GroupId: gid}
-				mm[gid] = mu
-			}
-			mu.DropAll = true
-		}
-	}
-	return mm
-}
-
-func commitOrAbort(ctx context.Context, tc *api.TxnContext) (*api.Payload, error) {
-	txn := posting.Txns().Get(tc.StartTs)
-	if txn == nil {
-		return &api.Payload{}, posting.ErrInvalidTxn
-	}
-	// Ensures that we wait till prewrite is applied
-	idx := txn.LastIndex()
-	groups().Node.Applied.WaitForMark(ctx, idx)
-	if tc.CommitTs == 0 {
-		err := txn.AbortMutations(ctx)
-		return &api.Payload{}, err
-	}
-	err := txn.CommitMutations(ctx, tc.CommitTs)
-	return &api.Payload{}, err
-}
-
-type res struct {
-	err error
-	ctx *api.TxnContext
 }
 
 // MutateOverNetwork checks which group should be running the mutations
-// according to the group config and sends it to that instance.
-func MutateOverNetwork(ctx context.Context, m *intern.Mutations) (*api.TxnContext, error) {
-	tctx := &api.TxnContext{StartTs: m.StartTs}
-	tctx.LinRead = &api.LinRead{Ids: make(map[uint32]uint64)}
-	mutationMap := populateMutationMap(m)
+// according to fingerprint of the predicate and sends it to that instance.
+func MutateOverNetwork(ctx context.Context, m *task.Mutations) error {
+	mutationMap := make(map[uint32]*task.Mutations)
+	addToMutationMap(mutationMap, m.Edges)
 
-	resCh := make(chan res, len(mutationMap))
+	errors := make(chan error, len(mutationMap))
 	for gid, mu := range mutationMap {
-		if gid == 0 {
-			return tctx, errUnservedTablet
-		}
-		mu.StartTs = m.StartTs
-		go proposeOrSend(ctx, gid, mu, resCh)
+		proposeOrSend(ctx, gid, mu, errors)
 	}
 
 	// Wait for all the goroutines to reply back.
 	// We return if an error was returned or the parent called ctx.Done()
-	var e error
 	for i := 0; i < len(mutationMap); i++ {
-		res := <-resCh
-		if res.err != nil {
-			e = res.err
-			if tr, ok := trace.FromContext(ctx); ok {
-				tr.LazyPrintf("Error while running all mutations: %+v", res.err)
+		select {
+		case err := <-errors:
+			if err != nil {
+				x.TraceError(ctx, x.Wrapf(err, "Error while running all mutations"))
+				return err
 			}
-		}
-		if res.ctx != nil {
-			y.MergeLinReads(tctx.LinRead, res.ctx.LinRead)
-			tctx.Keys = append(tctx.Keys, res.ctx.Keys...)
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	close(resCh)
-	return tctx, e
-}
+	close(errors)
 
-func CommitOverNetwork(ctx context.Context, tc *api.TxnContext) (uint64, error) {
-	pl := groups().Leader(0)
-	if pl == nil {
-		return 0, conn.ErrNoConnection
-	}
-	zc := intern.NewZeroClient(pl.Get())
-	tctx, err := zc.CommitOrAbort(ctx, tc)
-	if err != nil {
-		return 0, err
-	}
-	if tctx.Aborted {
-		return 0, y.ErrAborted
-	}
-	return tctx.CommitTs, nil
-}
-
-func (w *grpcWorker) CommitOrAbort(ctx context.Context, tc *api.TxnContext) (*api.Payload, error) {
-	node := groups().Node
-	err := node.ProposeAndWait(ctx, &intern.Proposal{TxnContext: tc})
-	return &api.Payload{}, err
-}
-
-func (w *grpcWorker) MinTxnTs(ctx context.Context,
-	payload *api.Payload) (*intern.Num, error) {
-	n := &intern.Num{}
-	n.Val = posting.Txns().MinTs()
-	return n, nil
+	return nil
 }
 
 // Mutate is used to apply mutations over the network on other instances.
-func (w *grpcWorker) Mutate(ctx context.Context, m *intern.Mutations) (*api.TxnContext, error) {
-	txnCtx := &api.TxnContext{}
+func (w *grpcWorker) Mutate(ctx context.Context, m *task.Mutations) (*Payload, error) {
 	if ctx.Err() != nil {
-		return txnCtx, ctx.Err()
+		return &Payload{}, ctx.Err()
 	}
+
 	if !groups().ServesGroup(m.GroupId) {
-		return txnCtx, x.Errorf("This server doesn't serve group id: %v", m.GroupId)
+		return &Payload{}, x.Errorf("This server doesn't serve group id: %v", m.GroupId)
 	}
+	c := make(chan error, 1)
+	node := groups().Node(m.GroupId)
+	go func() { c <- node.ProposeAndWait(ctx, &task.Proposal{Mutations: m}) }()
 
-	node := groups().Node
-	if rand.Float64() < Config.Tracing {
-		var tr trace.Trace
-		tr, ctx = x.NewTrace("GrpcMutate", ctx)
-		defer tr.Finish()
-	}
-
-	err := node.ProposeAndWait(ctx, &intern.Proposal{Mutations: m})
-	txnCtx.StartTs = m.StartTs
-	txnCtx.LinRead = &api.LinRead{
-		Ids: map[uint32]uint64{
-			m.GroupId: node.Applied.DoneUntil(),
-		},
-	}
-	return txnCtx, err
-}
-
-func tryAbortTransactions(startTimestamps []uint64) {
-	pl := groups().Leader(0)
-	if pl == nil {
-		return
-	}
-	zc := intern.NewZeroClient(pl.Get())
-	// Aborts if not already committed.
-	req := &intern.TxnTimestamps{Ts: startTimestamps}
-	resp, err := zc.TryAbort(context.Background(), req)
-	for err != nil {
-		resp, err = zc.TryAbort(context.Background(), req)
-	}
-	commitTimestamps := resp.Ts
-	x.AssertTrue(len(startTimestamps) == len(commitTimestamps))
-
-	for i, startTs := range startTimestamps {
-		tctx := &api.TxnContext{StartTs: startTs, CommitTs: commitTimestamps[i]}
-		_, err := commitOrAbort(context.Background(), tctx)
-		for err != nil {
-			// This will fail only due to badger error.
-			_, err = commitOrAbort(context.Background(), tctx)
-		}
+	select {
+	case <-ctx.Done():
+		return &Payload{}, ctx.Err()
+	case err := <-c:
+		return &Payload{}, err
 	}
 }
